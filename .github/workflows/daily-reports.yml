@@ -1,0 +1,120 @@
+name: MSAI Marketing Reports
+
+on:
+  schedule:
+    # 11:00 UTC = 6:00 AM US Central (CDT). In winter (CST) this lands at 5:00 AM.
+    # Change to '0 12 * * *' if you want 6:00 AM year-round in winter.
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Run one report only (influence | netnew | sla). Blank = all three.'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Build reports but do not upload to SharePoint'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # needed only to commit prior_snapshot.json back
+
+concurrency:
+  group: msai-reports
+  cancel-in-progress: false
+
+jobs:
+  reports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TZ: America/Chicago   # so filenames and Archive date stamps match local dates
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The three generators read config.env directly (not environment variables),
+      # so we write it from GitHub Secrets at run time. It never touches the repo.
+      - name: Write config.env from secrets
+        run: |
+          cat > config.env <<EOF
+          PUBLISH_TARGET=supabase
+          HUBSPOT_TOKEN=${{ secrets.HUBSPOT_TOKEN }}
+          HUBSPOT_PORTAL_ID=20335613
+          CAMPAIGN_INFLUENCE_FOLDER_ID=240016304
+          NET_NEW_PIPELINE_ID=813739955
+          DEALS_CREATED_SINCE=2025-06-01
+          WINDSOR_API_KEY=${{ secrets.WINDSOR_API_KEY }}
+          WINDSOR_DATE_PRESET=last_365d
+          SLA_DAYS_IN_PROGRESS=14
+          SLA_DAYS_QUALIFIED=14
+          SLA_DAYS_AWAITING_SALES_QUALIFICATION=1
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY=${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_BUCKET=reports
+          # Only used when PUBLISH_TARGET is sharepoint or both. Leave the
+          # secrets unset if you are not publishing to SharePoint.
+          MSAI_TENANT_ID=${{ secrets.MSAI_TENANT_ID }}
+          MSAI_CLIENT_ID=${{ secrets.MSAI_CLIENT_ID }}
+          MSAI_CLIENT_SECRET=${{ secrets.MSAI_CLIENT_SECRET }}
+          EOF
+
+      - name: Run reports
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.only }}" ];      then ARGS="$ARGS --only ${{ inputs.only }}"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ];    then ARGS="$ARGS --dry-run"; fi
+          python run_all_reports.py $ARGS
+
+      # Writes this run's numbers into the Supabase history tables. Runs even
+      # if the report step failed, so a partial run still records what it got.
+      # continue-on-error: a Supabase hiccup must not mark the whole run failed
+      # when the workbooks already reached SharePoint.
+      - name: Push history to Supabase
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python push_history.py --dry-run
+          else
+            python push_history.py
+          fi
+
+      - name: Remove secrets file
+        if: always()
+        run: rm -f config.env
+
+      # prior_snapshot.json is how the Pipeline Influence report computes
+      # week-over-week change. Runners are wiped after each run, so it is
+      # committed back to the repo to survive.
+      - name: Persist week-over-week snapshot
+        if: success()
+        run: |
+          if [ -n "$(git status --porcelain prior_snapshot.json)" ]; then
+            git config user.name  'msai-reports-bot'
+            git config user.email 'msai-reports-bot@users.noreply.github.com'
+            git add prior_snapshot.json
+            git commit -m "snapshot: $(date +%Y-%m-%d)"
+            git push
+          fi
+
+      # Logs and the built files, kept 30 days, so you can check a run
+      # without the SharePoint folder.
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ github.run_number }}
+          path: |
+            output/
+            logs/
+          retention-days: 30
+          if-no-files-found: warn
