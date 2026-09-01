@@ -44,12 +44,21 @@ Only two, and you can get both yourself.
 
 HubSpot > Settings (gear) > Integrations > Private Apps. Find the existing app
 for reporting and delete it - it was tied to the lost drive - then create a new
-one. Give it these four scopes, all read-only, and nothing else:
+one. Give it these five scopes, all read-only, and nothing else:
 
 - `crm.lists.read`
 - `crm.objects.contacts.read`
 - `crm.objects.companies.read`
 - `crm.objects.deals.read`
+- `crm.objects.owners.read`
+
+That last one is easy to miss and the original README omitted it. Without it
+the Pipeline Influence and Net New reports build fine and the SLA report fails
+immediately with `HTTP Error 403: Forbidden`, because its first call is
+`GET /crm/v3/owners` to get the rep names it groups breaches by.
+
+If you need to add a scope later, edit the private app and save. The token does
+not change, so there is nothing to update in GitHub secrets - just re-run.
 
 Copy the token when it is shown. You cannot see it again after you close that
 screen. Paste it somewhere temporary for now.
@@ -111,11 +120,25 @@ git config --global user.email "alecia.obrien@multisensorai.com"
 git config --global user.name "Alecia O'Brien"
 ```
 
-Now replace `<org>` with the GitHub organization name from the URL on your
-screen, and run:
+Now connect it to the repo you just created. The org is `marketing-team-msai`,
+so this is the literal command - no placeholders to substitute:
 
 ```bash
-git remote add origin https://github.com/<org>/msai-marketing-reports.git
+git remote add origin https://github.com/marketing-team-msai/msai-marketing-reports.git
+```
+
+If you already ran this and got `error: remote origin already exists`, or a
+`400` on the push because angle brackets ended up in the URL, correct it in
+place instead:
+
+```bash
+git remote set-url origin https://github.com/marketing-team-msai/msai-marketing-reports.git
+```
+
+Check it before pushing - the URL must have no `<` or `>` in it:
+
+```bash
+git remote -v
 ```
 
 ```bash
@@ -136,9 +159,25 @@ This is now both where the workbooks live and where the history is kept.
 
 1. supabase.com > sign in > **New project**
 2. Name: `msai-marketing-history`
-3. Region: pick the US region closest to you (`us-east-1` is fine)
-4. Set a database password. Save it in your password manager - you will not
-   need it for this setup, but you will regret losing it later.
+3. Region: pick the US region closest to you (Americas / `us-east-1` is fine)
+4. Set a database password and **copy it into your password manager now** - the
+   field is masked afterwards. You will not need it for this setup, but you
+   will regret losing it later.
+5. Under **Security**, set the three options like this:
+
+| Option | Set to | Why |
+|---|---|---|
+| Enable Data API | **on** | Required. `push_history.py` writes the history rows through it. |
+| Automatically expose new tables | **off** | Supabase's own recommendation. It grants the public `anon` role privileges on every new table. The job uses the service_role key, which bypasses that, so turning it off costs nothing. |
+| Enable automatic RLS | **on** | `supabase_schema.sql` already enables RLS on all seven tables, but this protects any future table the moment it is created. |
+
+None of these affect the daily run - the service_role key bypasses RLS
+entirely. What they do affect is the dashboard later: with auto-expose off, a
+Lovable app using the anon key sees nothing until you deliberately grant access
+to the specific views it needs. That is the intended behaviour, not a fault.
+
+The storage bucket is unaffected by all three. It is created private by the
+first run either way.
 
 Free tier is fine to start. See "Watch the storage total" under Living with it
 for when that stops being true.
@@ -214,8 +253,15 @@ and a line saying `dry run, nothing published`. Three of three generated is the
 proof that HubSpot is working.
 
 **If it fails here**, it is almost always the HubSpot token: either mistyped,
-or missing one of the four scopes. Open the log and read the last few red
+or missing one of the five scopes. Open the log and read the last few red
 lines - they name the problem directly.
+
+A `403 Forbidden` on one report while the others say `ok` is a missing scope,
+not a bad token. `FAIL   Lead Pipeline SLA after 0s` with a 403 specifically
+means `crm.objects.owners.read` is missing.
+
+To retest one report in about 40 seconds instead of two minutes, put
+`influence`, `netnew`, or `sla` in the **only** box.
 
 ## Step 8. Second test - the real thing
 

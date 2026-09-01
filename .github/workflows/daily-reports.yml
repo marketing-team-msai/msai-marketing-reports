@@ -8,11 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one report only (influence | netnew | sla). Blank = all three.'
+        description: 'Run one report only: influence, netnew or sla. Blank = all three.'
         required: false
         default: ''
       dry_run:
-        description: 'Build reports but do not upload to SharePoint'
+        description: 'Build reports only - do not publish or record history'
         type: boolean
         default: false
 

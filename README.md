@@ -58,6 +58,8 @@ is measured; the raw top-of-funnel Lead stage is excluded so per-rep averages
 reflect a real working book.
 
 All three read HubSpot **read-only**. Nothing is ever written back to HubSpot.
+The SLA report is the only one that needs the `crm.objects.owners.read` scope,
+which it uses to turn owner ids into rep names.
 
 PowerPoint decks were part of this system until 31 August 2026 and have been
 retired. Workbooks only.
@@ -132,10 +134,13 @@ Four secret values on the default path, held as **GitHub repository secrets**
 (Settings > Secrets and variables > Actions). Nothing lives in a file on
 anyone's machine.
 
-1. `HUBSPOT_TOKEN` - a HubSpot private-app token with **read-only** scopes
-   (`crm.lists.read`, `crm.objects.contacts.read`,
-   `crm.objects.companies.read`, `crm.objects.deals.read`). Created by a
-   HubSpot admin under Settings > Integrations > Private Apps.
+1. `HUBSPOT_TOKEN` - a HubSpot private-app token with five **read-only** scopes:
+   `crm.lists.read`, `crm.objects.contacts.read`, `crm.objects.companies.read`,
+   `crm.objects.deals.read` and `crm.objects.owners.read`. Created by a HubSpot
+   admin under Settings > Integrations > Private Apps. The owners scope is only
+   used by the SLA report, which calls `GET /crm/v3/owners` first to resolve rep
+   names; without it that report fails immediately with a 403 while the other
+   two succeed.
 2. `WINDSOR_API_KEY` - the API key from the Windsor.ai account.
 3. `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` - from Supabase, Settings > API.
    Use the **service_role** key, not the anon key. It bypasses row-level
@@ -180,7 +185,11 @@ Open the Actions tab, click the failed run, click the `reports` job, and read
 the log.
 
 - **Reports fail before any upload.** Almost always the HubSpot token: expired,
-  revoked, or missing one of the four scopes.
+  revoked, or missing one of the five scopes.
+- **One report 403s while the others say `ok`.** A missing scope, not a bad
+  token. `FAIL   Lead Pipeline SLA after 0s` with a 403 means
+  `crm.objects.owners.read` is missing. Add it to the private app and re-run;
+  editing scopes does not change the token.
 - **`no Supabase credentials`, `failed=3`.** `SUPABASE_URL` or
   `SUPABASE_SERVICE_KEY` is missing or misspelled in the GitHub secrets.
 - **Uploads fail with a `403`.** Almost certainly the anon key was pasted
