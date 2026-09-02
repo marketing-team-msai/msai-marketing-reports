@@ -109,7 +109,8 @@ def init_creds(path=None):
 # ---------------------------------------------------------------------------
 COLUMNS = {
     "snap_influence": [
-        "snapshot_date", "deal_id", "contact_id", "campaign_id", "campaign_name",
+        "snapshot_date", "deal_id", "contact_id", "contact_name", "contact_email",
+        "campaign_id", "campaign_name",
         "campaign_type", "even_split_value", "amount_home", "deal_name",
         "company_name", "pipeline", "stage", "close_date", "create_date",
         "is_won", "is_closed", "is_amazon", "is_galco", "is_internal",
@@ -372,11 +373,18 @@ def rows_influence(snapshot_date, ds):
         amazon = netnew.is_amazon(company) or netnew.is_amazon(d["name"])
         galco = netnew.is_galco(company) or netnew.is_galco(d["name"])
         for cid in sorted(cids):
+            email = ds["cemail"](cid)
+            internal = _is_internal(email)
             for camp in sorted(cc[cid]):
                 out.append({
                     "snapshot_date": snapshot_date,
                     "deal_id": did,
                     "contact_id": cid,
+                    # The influence dataset already fetches firstname, lastname
+                    # and email for every influenced contact; this is the same
+                    # data the workbook showed under Deal Contact Details.
+                    "contact_name": ds["cname"](cid),
+                    "contact_email": email,
                     "campaign_id": camp_ids.get(camp),
                     "campaign_name": camp,
                     "campaign_type": influence.classify_campaign(camp),
@@ -392,7 +400,7 @@ def rows_influence(snapshot_date, ds):
                     "is_closed": d["closed"],
                     "is_amazon": amazon,
                     "is_galco": galco,
-                    "is_internal": _is_internal(ds["cemail"](cid)),
+                    "is_internal": internal,
                     # There is no page-level signal at this grain to classify
                     # on, so this is constant here by design, like is_seeded.
                     "is_storefront": IS_STOREFRONT,
@@ -681,6 +689,7 @@ def _selftest():
         "deal_company_name": lambda d: "Acme Co",
         "cemail": lambda c: {"C1": "buyer@acme.com",
                              "C2": "alecia@multisensorai.com"}.get(c, ""),
+        "cname": lambda c: {"C1": "Pat Buyer", "C2": "Alecia OBrien"}.get(c, ""),
     }
     ds_nn = {
         "deals": {"D1": {"name": "D", "amount": 100.0, "pipeline": "P", "stage": "S",
@@ -726,6 +735,8 @@ def _selftest():
     print("  900.00 / 2 campaigns in union = 450.0 expected")
     print("  even_split_value values present: %s"
           % sorted({r["even_split_value"] for r in inf}))
+    print("  contact identity: %s"
+          % sorted({(r["contact_name"], r["contact_email"]) for r in inf}))
     for r in inf:
         print("    %s x %s x %-35s %s"
               % (r["deal_id"], r["contact_id"], r["campaign_name"],
