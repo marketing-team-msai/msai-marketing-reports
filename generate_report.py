@@ -26,29 +26,69 @@ from openpyxl.utils import get_column_letter
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------- config ------
+# Environment keys this module will accept as a stand-in for config.env.
+# Scoped to known prefixes so os.environ at large never lands in CFG.
+_ENV_PREFIXES = ("HUBSPOT_", "CAMPAIGN_", "DEALS_", "WINDSOR_", "NET_NEW_",
+                 "SLA_DAYS_", "SUPABASE_", "MSAI_", "MKTG_")
+_ENV_KEYS = ("PUBLISH_TARGET",)
+
 def load_config(path=None):
+    """Read config.env, then fill anything it does not set from the environment.
+
+    The file is optional so this module can run on environment variables alone.
+    When the file exists its values win, which keeps the CI path (the workflow
+    writes config.env from secrets) behaving exactly as it did before."""
     path = path or os.path.join(HERE, "config.env")
     cfg = {}
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip()
+    for k, v in os.environ.items():
+        if k.startswith(_ENV_PREFIXES) or k in _ENV_KEYS:
+            cfg[k] = v
+    if os.path.exists(path):
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
     return cfg
 
-CFG = load_config()
-HS_TOKEN = CFG["HUBSPOT_TOKEN"]
-PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
-FOLDER_ID = CFG.get("CAMPAIGN_INFLUENCE_FOLDER_ID", "240016304")
-SINCE = CFG.get("DEALS_CREATED_SINCE", "2025-06-01")
-WINDSOR_KEY = CFG.get("WINDSOR_API_KEY", "")
-WINDSOR_PRESET = CFG.get("WINDSOR_DATE_PRESET", "last_365d")
+# Settings live here but are populated by init(), not at import time, so that
+# importing this module for its pull/compute functions costs nothing and does
+# not require a token to be present. main() calls init() first; so does any
+# external caller (see sync_to_mktg.py).
+CFG = {}
+HS_TOKEN = None
+PORTAL = "20335613"
+FOLDER_ID = "240016304"
+SINCE = "2025-06-01"
+WINDSOR_KEY = ""
+WINDSOR_PRESET = "last_365d"
 OUTDIR = os.path.join(HERE, "output")
-os.makedirs(OUTDIR, exist_ok=True)
-
 HS = "https://api.hubapi.com"
-HH = {"Authorization": "Bearer " + HS_TOKEN, "Content-Type": "application/json"}
+HH = {}
+_READY = False
+
+def init(path=None, make_outdir=True):
+    """Load config and populate module settings. Idempotent."""
+    global CFG, HS_TOKEN, PORTAL, FOLDER_ID, SINCE, WINDSOR_KEY, WINDSOR_PRESET
+    global HH, _READY
+    if _READY:
+        return CFG
+    CFG = load_config(path)
+    HS_TOKEN = CFG.get("HUBSPOT_TOKEN") or ""
+    if not HS_TOKEN:
+        raise RuntimeError("HUBSPOT_TOKEN is not set. Put it in config.env next "
+                           "to this script, or export it in the environment.")
+    PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
+    FOLDER_ID = CFG.get("CAMPAIGN_INFLUENCE_FOLDER_ID", "240016304")
+    SINCE = CFG.get("DEALS_CREATED_SINCE", "2025-06-01")
+    WINDSOR_KEY = CFG.get("WINDSOR_API_KEY", "")
+    WINDSOR_PRESET = CFG.get("WINDSOR_DATE_PRESET", "last_365d")
+    HH = {"Authorization": "Bearer " + HS_TOKEN, "Content-Type": "application/json"}
+    if make_outdir:
+        os.makedirs(OUTDIR, exist_ok=True)
+    _READY = True
+    return CFG
 
 # ------------------------------------------------------------- hubspot io -----
 def hs_get(path, params=None):
@@ -121,7 +161,8 @@ def pull_memberships(list_id):
 
 def pull_deals():
     ms = since_ms()
-    props = ["dealname", "amount", "pipeline", "dealstage", "closedate", "createdate"]
+    props = ["dealname", "amount", "amount_in_home_currency", "pipeline", "dealstage",
+             "closedate", "createdate", "hs_is_closed_won", "hs_is_closed"]
     out, after = [], None
     while True:
         body = {"filterGroups": [{"filters": [
@@ -191,14 +232,20 @@ def build_dataset():
     deals = {}
     for d in raw_deals:
         p = d["properties"]
-        amt = float(p.get("amount") or 0)
+        # Home currency only, matching the rule used across this system. The
+        # raw amount is the fallback when a deal has no home-currency value.
+        amt = float(p.get("amount_in_home_currency") or p.get("amount") or 0)
         cd = (p.get("closedate") or "")[:10]
         deals[d["id"]] = {
             "id": d["id"], "name": p.get("dealname") or "",
             "amount": amt,
+            "amount_home": amt,
             "pipeline": pipe_label.get(p.get("pipeline"), p.get("pipeline") or ""),
             "stage": stage_label.get(p.get("dealstage"), p.get("dealstage") or ""),
             "close": cd,
+            "create": (p.get("createdate") or "")[:10],
+            "won": str(p.get("hs_is_closed_won")).lower() == "true",
+            "closed": str(p.get("hs_is_closed")).lower() == "true",
         }
     total_deals = len(deals)
     total_value = sum(x["amount"] for x in deals.values())
@@ -580,6 +627,7 @@ def build_workbook(ds, camp_rows, n_producing, multi_rows, windsor, gen_date):
 # =============================================================== CHARTS ========
 # =============================================================== MAIN ==========
 def main():
+    init()
     gen_date = datetime.now(timezone.utc)
     # prior-refresh snapshot for week-over-week (seeded with the July 9 baseline)
     prior_path = os.path.join(HERE, "prior_snapshot.json")

@@ -44,27 +44,61 @@ from openpyxl.utils import get_column_letter
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------- config ------
+# Environment keys this module will accept as a stand-in for config.env.
+# Scoped to known prefixes so os.environ at large never lands in CFG.
+_ENV_PREFIXES = ("HUBSPOT_", "CAMPAIGN_", "DEALS_", "WINDSOR_", "NET_NEW_",
+                 "SLA_DAYS_", "SUPABASE_", "MSAI_", "MKTG_")
+_ENV_KEYS = ("PUBLISH_TARGET",)
+
 def load_config(path=None):
+    """Read config.env, then fill anything it does not set from the environment.
+
+    The file is optional so this module can run on environment variables alone.
+    When the file exists its values win, which keeps the CI path (the workflow
+    writes config.env from secrets) behaving exactly as it did before."""
     path = path or os.path.join(HERE, "config.env")
     cfg = {}
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip()
+    for k, v in os.environ.items():
+        if k.startswith(_ENV_PREFIXES) or k in _ENV_KEYS:
+            cfg[k] = v
+    if os.path.exists(path):
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
     return cfg
 
-CFG = load_config()
-HS_TOKEN = CFG["HUBSPOT_TOKEN"]
-PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
-SINCE = CFG.get("DEALS_CREATED_SINCE", "2025-06-01")
-NET_NEW_PIPELINE_ID = CFG.get("NET_NEW_PIPELINE_ID", "813739955")
+# Populated by init(), not at import time. See the note in generate_report.py.
+CFG = {}
+HS_TOKEN = None
+PORTAL = "20335613"
+SINCE = "2025-06-01"
+NET_NEW_PIPELINE_ID = "813739955"
 OUTDIR = os.path.join(HERE, "output")
-os.makedirs(OUTDIR, exist_ok=True)
-
 HS = "https://api.hubapi.com"
-HH = {"Authorization": "Bearer " + HS_TOKEN, "Content-Type": "application/json"}
+HH = {}
+_READY = False
+
+def init(path=None, make_outdir=True):
+    """Load config and populate module settings. Idempotent."""
+    global CFG, HS_TOKEN, PORTAL, SINCE, NET_NEW_PIPELINE_ID, HH, _READY
+    if _READY:
+        return CFG
+    CFG = load_config(path)
+    HS_TOKEN = CFG.get("HUBSPOT_TOKEN") or ""
+    if not HS_TOKEN:
+        raise RuntimeError("HUBSPOT_TOKEN is not set. Put it in config.env next "
+                           "to this script, or export it in the environment.")
+    PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
+    SINCE = CFG.get("DEALS_CREATED_SINCE", "2025-06-01")
+    NET_NEW_PIPELINE_ID = CFG.get("NET_NEW_PIPELINE_ID", "813739955")
+    HH = {"Authorization": "Bearer " + HS_TOKEN, "Content-Type": "application/json"}
+    if make_outdir:
+        os.makedirs(OUTDIR, exist_ok=True)
+    _READY = True
+    return CFG
 
 # ------------------------------------------------------- offsite model facts --
 # From H2-Q3 Sales & Mktg Plan - July 2026.pptx (ELT offsite 2026-07-15) and the
@@ -196,7 +230,8 @@ def pull_netnew_deals():
     """Deals in the Net New Pipeline created since the window start."""
     ms = since_ms()
     props = ["dealname", "amount", "pipeline", "dealstage", "closedate", "createdate",
-             "hs_is_closed_won", "hs_is_closed", "amount_in_home_currency"]
+             "hs_is_closed_won", "hs_is_closed", "amount_in_home_currency",
+             "hubspot_owner_id"]
     out, after = [], None
     while True:
         body = {"filterGroups": [{"filters": [
@@ -290,6 +325,7 @@ def build_dataset():
             "won": (str(p.get("hs_is_closed_won")).lower() == "true")
                    or (p.get("dealstage") in won_stage_ids),
             "closed": (str(p.get("hs_is_closed")).lower() == "true"),
+            "owner_id": p.get("hubspot_owner_id") or "",
         }
     print("      %d net-new deals, $%.0f total amount"
           % (len(deals), sum(x["amount"] for x in deals.values())), flush=True)
@@ -309,7 +345,9 @@ def build_dataset():
 
     # tag Amazon / Galco using company name OR deal name
     for did, d in deals.items():
+        cos = d2co.get(did, [])
         conm = deal_company_name(did)
+        d["company_id"] = cos[0] if cos else ""
         d["company"] = conm
         d["amazon"] = is_amazon(conm) or is_amazon(d["name"])
         d["galco"] = is_galco(conm) or is_galco(d["name"])
@@ -329,18 +367,38 @@ def build_dataset():
         d["campaigns"] = camps
         d["single_program"] = (len(progs) == 1)
         d["program"] = next(iter(progs)) if len(progs) == 1 else ("(multi)" if progs else "")
-        contacts_needed.update(inf)
+        # All associated contacts, not just influenced ones: the deal's
+        # vertical is derived from whichever of them carries an industry.
+        contacts_needed.update(d2c.get(did, []))
 
     print("[5/6] influenced-contact details ...", flush=True)
     contact_props = batch_read("contacts", contacts_needed,
-        ["firstname", "lastname", "email", "createdate", "lifecyclestage"]) if contacts_needed else {}
+        ["firstname", "lastname", "email", "createdate", "lifecyclestage",
+         "industry", "primary_subindustry_dropdown"]) if contacts_needed else {}
+
+    # Vertical is a CONTACT property. A deal takes the first non-null industry
+    # among its associated contacts, and "Unknown" when none of them carries one.
+    for did, d in deals.items():
+        vert = sub = ""
+        for c in d2c.get(did, []):
+            cp = contact_props.get(c, {})
+            if not vert:
+                vert = (cp.get("industry") or "").strip()
+            if not sub:
+                sub = (cp.get("primary_subindustry_dropdown") or "").strip()
+            if vert and sub:
+                break
+        d["vertical"] = vert or "Unknown"
+        d["sub_vertical"] = sub or "Unknown"
 
     # ---- CONTACT-GRAIN: marketing-sourced contacts (created in window, in a CI list)
     print("[6/6] contact-grain (marketing-sourced contacts) ...", flush=True)
     # Pull createdate + lifecyclestage for the FULL mapped universe (all CI-list members)
     all_mapped = list(contact_campaigns.keys())
     src_props = batch_read("contacts", all_mapped,
-        ["createdate", "lifecyclestage", "firstname", "lastname", "email"]) if all_mapped else {}
+        ["createdate", "lifecyclestage", "firstname", "lastname", "email",
+         "hubspot_owner_id", "industry",
+         "primary_subindustry_dropdown"]) if all_mapped else {}
     ms_int = int(since_ms())
     sourced_contacts = {}   # cid -> props (created in window)
     for cid, p in src_props.items():
@@ -690,6 +748,7 @@ def build_workbook(ds, dg, camp_rows, n_prod, funnel, funnel_total, gen_date):
 # =============================================================== CHARTS ========
 # =============================================================== MAIN ==========
 def main():
+    init()
     global dg_sourced, dg_share
     gen_date = datetime.now(timezone.utc)
     ds = build_dataset()

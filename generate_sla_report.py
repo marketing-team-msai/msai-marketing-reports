@@ -64,23 +64,39 @@ BASE = "https://api.hubapi.com"
 
 
 # ---------------------------------------------------------------- config ------
+# Environment keys this module will accept as a stand-in for config.env.
+# Scoped to known prefixes so os.environ at large never lands in CFG.
+_ENV_PREFIXES = ("HUBSPOT_", "CAMPAIGN_", "DEALS_", "WINDSOR_", "NET_NEW_",
+                 "SLA_DAYS_", "SUPABASE_", "MSAI_", "MKTG_")
+_ENV_KEYS = ("PUBLISH_TARGET",)
+
 def load_config(path=None):
+    """Read config.env, then fill anything it does not set from the environment.
+
+    The file is optional so this module can run on environment variables alone.
+    When the file exists its values win, which keeps the CI path (the workflow
+    writes config.env from secrets) behaving exactly as it did before."""
     path = path or os.path.join(HERE, "config.env")
     cfg = {}
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip()
+    for k, v in os.environ.items():
+        if k.startswith(_ENV_PREFIXES) or k in _ENV_KEYS:
+            cfg[k] = v
+    if os.path.exists(path):
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
     return cfg
 
 
-CFG = load_config()
-HS_TOKEN = CFG["HUBSPOT_TOKEN"]
-PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
+# Populated by init(), not at import time. See the note in generate_report.py.
+CFG = {}
+HS_TOKEN = None
+PORTAL = "20335613"
 OUTDIR = os.path.join(HERE, "output")
-os.makedirs(OUTDIR, exist_ok=True)
+_READY = False
 
 
 def _sla_days(key, default):
@@ -98,20 +114,48 @@ def _sla_days(key, default):
         return float(default), False
 
 
-_ip, _ip_set = _sla_days("SLA_DAYS_IN_PROGRESS", 14)
-_q, _q_set = _sla_days("SLA_DAYS_QUALIFIED", 14)
-_a, _a_set = _sla_days("SLA_DAYS_AWAITING_SALES_QUALIFICATION", 1)
-
+# Defaults stand until init() reads the configured thresholds.
 SLA_DAYS = {
-    "In Progress": _ip,
-    "Qualified": _q,
-    "Awaiting Sales Qualification": _a,
+    "In Progress": 14.0,
+    "Qualified": 14.0,
+    "Awaiting Sales Qualification": 1.0,
 }
 SLA_FROM_CONFIG = {
-    "In Progress": _ip_set,
-    "Qualified": _q_set,
-    "Awaiting Sales Qualification": _a_set,
+    "In Progress": False,
+    "Qualified": False,
+    "Awaiting Sales Qualification": False,
 }
+
+
+def init(path=None, make_outdir=True):
+    """Load config and populate module settings, including the SLA thresholds.
+    Idempotent."""
+    global CFG, HS_TOKEN, PORTAL, SLA_DAYS, SLA_FROM_CONFIG, _READY
+    if _READY:
+        return CFG
+    CFG = load_config(path)
+    HS_TOKEN = CFG.get("HUBSPOT_TOKEN") or ""
+    if not HS_TOKEN:
+        raise RuntimeError("HUBSPOT_TOKEN is not set. Put it in config.env next "
+                           "to this script, or export it in the environment.")
+    PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
+    _ip, _ip_set = _sla_days("SLA_DAYS_IN_PROGRESS", 14)
+    _q, _q_set = _sla_days("SLA_DAYS_QUALIFIED", 14)
+    _a, _a_set = _sla_days("SLA_DAYS_AWAITING_SALES_QUALIFICATION", 1)
+    SLA_DAYS = {
+        "In Progress": _ip,
+        "Qualified": _q,
+        "Awaiting Sales Qualification": _a,
+    }
+    SLA_FROM_CONFIG = {
+        "In Progress": _ip_set,
+        "Qualified": _q_set,
+        "Awaiting Sales Qualification": _a_set,
+    }
+    if make_outdir:
+        os.makedirs(OUTDIR, exist_ok=True)
+    _READY = True
+    return CFG
 
 STAGE_LABEL = {
     "subscriber": "Subscriber",
@@ -309,7 +353,35 @@ def build_snapshot():
     headline = {}
     by_rep_sla = defaultdict(dict)
     stuck_buckets = []
-    detail_rows = []
+
+    # One detail row per contact in the worked-pipeline population, seeded
+    # before the SLA loop so the detail covers the whole book and not just the
+    # three tracked lead-status buckets. Identity, owner and lifecycle-stage
+    # timing populate for everyone; the SLA fields stay blank for contacts
+    # whose lead_status is not one we track, which is correct rather than a gap.
+    detail_by_id = {}
+    for stage, contacts in stage_pop.items():
+        for c in contacts:
+            p = c["properties"]
+            stage_raw = p.get("lifecyclestage") or stage
+            detail_by_id[c["id"]] = {
+                "contact_id": c["id"],
+                "owner_id": p.get("hubspot_owner_id") or "",
+                "status": "",
+                "sla": None,
+                "name": (("%s %s" % (p.get("firstname") or "",
+                                     p.get("lastname") or "")).strip()),
+                "email": p.get("email") or "",
+                "company": p.get("company") or "",
+                "rep": owner_of(p),
+                "stage": STAGE_LABEL.get(stage_raw, stage_raw),
+                "entered": "",
+                "src": "",
+                "days_status": "",
+                "over": "",
+                "days_stage": (lambda d: round(d, 1) if d is not None else "")(
+                    age_days(p.get("hs_v2_date_entered_current_stage"), now)),
+            }
 
     for status, sla in SLA_DAYS.items():
         contacts = search_contacts("hs_lead_status", status)
@@ -336,20 +408,27 @@ def build_snapshot():
                     over += 1
                     rep_over[rep] += 1
             stage_raw = p.get("lifecyclestage") or ""
-            detail_rows.append({
-                "status": status,
-                "sla": sla,
-                "name": (("%s %s" % (p.get("firstname") or "", p.get("lastname") or "")).strip()),
+            # The lead-status search is portal-wide, so a handful of these sit
+            # outside the four pipeline stages and have no seeded row yet.
+            row = detail_by_id.setdefault(c["id"], {
+                "contact_id": c["id"],
+                "owner_id": p.get("hubspot_owner_id") or "",
+                "name": (("%s %s" % (p.get("firstname") or "",
+                                     p.get("lastname") or "")).strip()),
                 "email": p.get("email") or "",
                 "company": p.get("company") or "",
                 "rep": rep,
                 "stage": STAGE_LABEL.get(stage_raw, stage_raw),
+                "days_stage": (lambda d: round(d, 1) if d is not None else "")(
+                    age_days(p.get("hs_v2_date_entered_current_stage"), now)),
+            })
+            row.update({
+                "status": status,
+                "sla": sla,
                 "entered": ts[:10] if ts else "(no history)",
                 "src": src or "",
                 "days_status": round(a, 1) if a is not None else "",
                 "over": "YES" if is_over else "no",
-                "days_stage": (lambda d: round(d, 1) if d is not None else "")(
-                    age_days(p.get("hs_v2_date_entered_current_stage"), now)),
             })
 
         total = len(contacts)
@@ -458,6 +537,7 @@ def build_snapshot():
                 "leads look fresh; this produced the earlier incorrect 26% for Qualified"),
         },
     }
+    detail_rows = list(detail_by_id.values())
     return snapshot, detail_rows
 
 
@@ -632,6 +712,7 @@ def build_workbook(snap, rows, out_path):
 
 # ----------------------------------------------------------------- main ------
 def main():
+    init()
     t0 = time.time()
     snap, rows = build_snapshot()
 
