@@ -149,7 +149,7 @@ ON_CONFLICT = {
     "snap_influence":       "snapshot_date,deal_id,contact_id,campaign_id",
     "snap_sourced_deal":    "snapshot_date,deal_id",
     "snap_sourced_contact": "snapshot_date,contact_id",
-    "snap_lead_sla":        "snapshot_date,contact_id,lead_status",
+    "snap_lead_sla":        "snapshot_date,contact_id",
     "run_log_reports":      "snapshot_date,report",
     "run_log":              "snapshot_date",
 }
@@ -275,6 +275,24 @@ def write_report_log(report, snapshot_date, generated_at, metrics, row_count,
         "metrics": metrics,
         "is_seeded": IS_SEEDED,
     }], dry_run=dry_run)
+
+
+def open_day_log(snapshot_date, started_at):
+    """Every snap_* table and run_log_reports carries a foreign key to
+    run_log.snapshot_date, so the day row has to exist before anything else can
+    be written. Opened as "running" here and rewritten with real numbers by
+    write_day_log once every report has been attempted."""
+    return sb_upsert("run_log", [{
+        "snapshot_date": snapshot_date,
+        "started_at": started_at,
+        "finished_at": None,
+        "status": "running",
+        "reports_run": 0,
+        "reports_failed": 0,
+        "rows_written": 0,
+        "notes": None,
+        "is_seeded": IS_SEEDED,
+    }])
 
 
 def write_day_log(snapshot_date, started_at, finished_at, reports_run,
@@ -442,8 +460,9 @@ def rows_sourced_contact(snapshot_date, ds, owners):
             "create_date": _date((p.get("createdate") or "")[:10]),
             "lifecycle_stage": p.get("lifecyclestage") or None,
             "num_campaigns": len(camps),
-            "programs": " | ".join(sorted({netnew.classify_program(c)
-                                           for c in camps})) or None,
+            # text[] in Postgres, so send a JSON array and let PostgREST cast
+            # it. A joined string is rejected as a malformed array literal.
+            "programs": sorted({netnew.classify_program(c) for c in camps}),
             "influenced_value": round(sum(deals[d]["amount"] for d in dids), 2),
             "owner_id": oid or None,
             "owner_name": owners.get(oid, ""),
@@ -757,6 +776,15 @@ def main():
     if args.only:
         jobs = [j for j in jobs if j[0] == args.only]
 
+    # Must come first: the foreign keys make every other write depend on it.
+    if not args.dry_run:
+        print("[day] opening run_log row ...")
+        try:
+            open_day_log(snapshot_date, gen_at)
+        except Exception as e:
+            sys.exit("Could not open the run_log row for %s. Nothing else can "
+                     "be written while it is missing: %s" % (snapshot_date, e))
+
     failures, rows_written, notes = 0, 0, []
     for name, fn in jobs:
         try:
@@ -769,7 +797,7 @@ def main():
             notes.append("%s failed: %s" % (name, str(e)[:120]))
             print("FAIL   %s: %s" % (name, e), file=sys.stderr)
 
-    print("[day] run_log ...")
+    print("[day] closing run_log row ...")
     day_failed = False
     try:
         write_day_log(snapshot_date, gen_at,
