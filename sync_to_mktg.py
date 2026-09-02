@@ -552,11 +552,17 @@ def run_netnew(snapshot_date, generated_at, dry_run=False, sample=2):
     sla.init()
     owners = sla.fetch_owners()
     ds = netnew.build_dataset()
-    dg = netnew.compute_deal_grain(ds)
 
+    # Sourced is decided per deal on its own merits: exactly the deals whose
+    # influenced contacts all fall in one program. Deliberately NOT taken from
+    # compute_deal_grain, which reproduces the old slide-15 view and drops
+    # Amazon while diverting Galco into a separate bucket - an exclusion that
+    # has since been overturned. is_single_program already implies influenced,
+    # since a deal with no influenced contacts has an empty program set.
+    sourced = [d for d in ds["deals"].values() if d.get("single_program")]
     headline = {
-        "sourced_deals": len(dg["single_rows"]),
-        "sourced_pipeline": round(sum(d["amount"] for d in dg["single_rows"]), 2),
+        "sourced_deals": len(sourced),
+        "sourced_pipeline": round(sum(d["amount"] for d in sourced), 2),
     }
     _report_delta("netnew", headline, list(headline), dry_run)
 
