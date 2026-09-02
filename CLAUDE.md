@@ -25,8 +25,20 @@ functions own all aggregation.
 
 ## Gotchas
 
-- `v_sourced_by_program` is program-grain. `count(*)` returns 4, not 148.
-  Deal count is `sum(sourced_deals)`. There is no `amount_home` column.
+- `f_sourced_by_program` is program-grain and returns 5 rows, not 148.
+  Four `row_type = 'program'` rows plus one `row_type = 'reconciling'` row
+  for multi-program deals. The headline is
+  `sum(sourced_pipeline) where row_type = 'program'` = 148 / $9,237,904.98.
+  Summing all five rows gives $11,690,160.95 and is wrong. `f_pipeline_model`
+  and the /overview tile and chart all filter on `row_type`; anything new
+  that reads this function must too. There is no `amount_home` column.
+  `v_sourced_by_program` is `select * from f_sourced_by_program(true, null)`,
+  deliberately one body so the two cannot drift.
+- `measurement` is `not_measured` for any program listed in the
+  `unmeasured_programs` row of `config_settings`, currently Advertising.
+  That zero means "not captured", not "captured and zero", and renders as a
+  dash. Delete the config row when `snap_ad_source` is built. PR & Brand's
+  zero is genuine and renders as $0.00.
 - `snap_sourced_deal` holds the FULL Net New population (861 rows), not only
   sourced deals. The 148 metric is `where is_single_program = true`, applied
   in the view, not the ETL. Table name is misleading; rename is deferred.
