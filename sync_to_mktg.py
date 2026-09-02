@@ -591,6 +591,28 @@ def check_schema():
               "(Settings > API > Exposed schemas)." % SCHEMA)
         return 1
 
+    # The spec above comes from PostgREST's schema cache and is readable
+    # without any privilege on the schema, so a clean column diff says nothing
+    # about whether we can actually read or write. Probe before reporting.
+    try:
+        sb_select("run_log", "limit=1")
+        print("access: %s.run_log readable" % SCHEMA)
+    except RuntimeError as e:
+        msg = str(e)
+        print("access: FAILED - %s" % msg[-160:])
+        if "42501" in msg or "permission denied" in msg:
+            print("")
+            print("The schema is exposed to the API but the role has no rights on")
+            print("it. Exposing a schema in Settings > API does not grant Postgres")
+            print("privileges. Run this once in the SQL editor:")
+            print("")
+            print("  grant usage on schema %s to service_role;" % SCHEMA)
+            print("  grant all on all tables in schema %s to service_role;" % SCHEMA)
+            print("  grant all on all sequences in schema %s to service_role;" % SCHEMA)
+            print("  alter default privileges in schema %s" % SCHEMA)
+            print("    grant all on tables to service_role;")
+        return 1
+
     problems = 0
     for table, cols in COLUMNS.items():
         print("")
@@ -748,6 +770,7 @@ def main():
             print("FAIL   %s: %s" % (name, e), file=sys.stderr)
 
     print("[day] run_log ...")
+    day_failed = False
     try:
         write_day_log(snapshot_date, gen_at,
                       datetime.now(timezone.utc).isoformat(),
@@ -755,12 +778,14 @@ def main():
                       notes="; ".join(notes) if notes else None,
                       dry_run=args.dry_run)
     except Exception as e:
+        day_failed = True
         print("FAIL   run_log day row: %s" % e, file=sys.stderr)
-        failures += 1
 
     print("")
     print("%d of %d report(s) synced." % (len(jobs) - failures, len(jobs)))
-    sys.exit(1 if failures else 0)
+    if day_failed:
+        print("run_log day row was not written.")
+    sys.exit(1 if (failures or day_failed) else 0)
 
 
 if __name__ == "__main__":
