@@ -8,8 +8,8 @@ touches Supabase Storage, and does not import run_all_reports.py or
 push_history.py.
 
 The snap_* tables are entity-grain detail, not aggregates. Roll-ups belong to
-the views (v_influence_by_campaign, v_sourced_by_program,
-v_sourced_contacts_by_stage, v_sla_by_status, v_sla_by_owner); this script
+the views and functions (v_influence_by_campaign, f_sourced_by_program,
+f_sourced_contacts_by_stage, v_sla_by_status, v_sla_by_owner); this script
 never computes or stores them.
 
   influence  generate_report.py         -> mktg.snap_influence
@@ -125,7 +125,7 @@ COLUMNS = {
     ],
     "snap_sourced_contact": [
         "snapshot_date", "contact_id", "email", "create_date", "lifecycle_stage",
-        "num_campaigns", "programs", "influenced_value", "owner_id",
+        "num_campaigns", "programs", "owner_id",
         "owner_name", "vertical", "sub_vertical", "is_amazon", "is_internal",
         "is_seeded",
     ],
@@ -445,9 +445,13 @@ def rows_sourced_contact(snapshot_date, ds, owners):
     """One row per marketing-sourced contact: created inside the window and a
     member of at least one Campaign Influence list.
 
-    influenced_value is the total home-currency amount of the Net New deals
-    this contact is associated with. It is per-contact and will double-count
-    across contacts on a shared deal - de-duplication is the view's job."""
+    Counts only, no dollar column. Ratified 2026-09-02: influenced_value used
+    to hold the full amount of every Net New deal a contact touched, so two
+    contacts on one deal each carried the whole deal and summing across
+    contacts double counted by $1,129,524.90 over 12 deals. This table has no
+    deal_id, so no consumer could have de-duplicated it. Dollars live at deal
+    grain, in snap_influence and snap_sourced_deal. Do not reintroduce a
+    per-contact dollar column here, even an even-split one."""
     cc = ds["contact_campaigns"]
     deals = ds["deals"]
 
@@ -471,7 +475,6 @@ def rows_sourced_contact(snapshot_date, ds, owners):
             # text[] in Postgres, so send a JSON array and let PostgREST cast
             # it. A joined string is rejected as a malformed array literal.
             "programs": sorted({netnew.classify_program(c) for c in camps}),
-            "influenced_value": round(sum(deals[d]["amount"] for d in dids), 2),
             "owner_id": oid or None,
             "owner_name": owners.get(oid, ""),
             # industry / primary_subindustry_dropdown are contact properties,
