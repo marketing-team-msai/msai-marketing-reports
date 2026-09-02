@@ -1,7 +1,21 @@
 -- =====================================================================
 -- mktg: program-bucket rework
 -- =====================================================================
--- NOT APPLIED. Read, approve, then run in the Supabase SQL editor.
+-- NOT APPLIED.
+--
+-- BLOCKED ON A FRONTEND CHANGE. Read this before scheduling it.
+--
+--   /overview calls f_sourced_by_program(include_amazon) for the Sourced
+--   Pipeline tile AND the by-program bar chart. This migration adds a
+--   (multi) row carrying 42 deals / $2,452,255.97 to that function's
+--   output. A tile that sums the rows it gets back jumps from
+--   $9,237,904.98 to $11,690,160.95, and the bar chart grows a $2,452,256
+--   "(multi)" bar plus two new zero bars.
+--
+--   That is the same trap this migration fixes inside f_pipeline_model,
+--   arriving through the frontend instead. /overview must filter
+--   row_type = 'program' on both the tile and the chart BEFORE this is
+--   applied. Dashboard first, then migrate.
 --
 -- What changes
 --   1. (unclassified) is dropped. Those 671 rows are uninfluenced deals,
@@ -11,8 +25,8 @@
 --      Advertising and PR & Brand stop vanishing from the output.
 --   3. Multi-program deals return as a single reconciling row, tagged
 --      row_type = 'reconciling'. The four program rows are 'program'.
---   4. f_pipeline_model filters row_type = 'program', so the headline
---      stays 148 / $9,237,904.98 and share-of-need stays 0.1848.
+--   4. f_pipeline_model filters row_type = 'program', so its numbers do
+--      not move.
 --
 -- Two grants traps this migration has to handle
 --   - Changing a function's RETURN TYPE means create-or-replace will not
@@ -21,7 +35,13 @@
 --   - DROP discards privileges. authenticated currently has SELECT on
 --     every mktg table and view, so the grants are re-issued below. Miss
 --     them and the dashboard 403s on its next read.
+--
+-- Run inside an explicit transaction. Apply, run the verification block,
+-- and only commit if every figure matches. If one misses, roll back and
+-- report rather than adjusting the SQL to match the output.
 -- =====================================================================
+
+begin;
 
 
 -- ---------------------------------------------------------------------
@@ -47,6 +67,10 @@ on conflict (key) do update
 -- ---------------------------------------------------------------------
 -- 2. f_sourced_by_program
 -- ---------------------------------------------------------------------
+-- No display strings are returned. row_type, program and the numbers go
+-- back; the frontend composes the reconciling row's caption, which for
+-- the current snapshot reads "Multi-program deals, not credited to any
+-- single program (42, $2,452,255.97)".
 drop function if exists mktg.f_sourced_by_program(boolean, integer);
 
 create function mktg.f_sourced_by_program(
@@ -57,7 +81,6 @@ returns table (
     snapshot_date    date,
     row_type         text,
     program          text,
-    label            text,
     measurement      text,
     sourced_deals    bigint,
     sourced_pipeline numeric,
@@ -98,9 +121,11 @@ as $function$
         select d.snapshot_date,
                'program'::text as row_type,
                p.program,
-               p.program       as label,
                case when p.program = any(u.names)
                     then 'not_measured' else 'measured' end as measurement,
+               -- count(s.deal_id), not count(*): with the zero-fill left
+               -- join count(*) returns 1 for a program with no deals, so
+               -- Advertising and PR & Brand would read 1 instead of 0.
                count(s.deal_id)                                              as sourced_deals,
                coalesce(sum(s.amount_home), 0)                               as sourced_pipeline,
                coalesce(sum(s.amount_home) filter (where s.is_closed_won), 0) as sourced_won,
@@ -115,15 +140,11 @@ as $function$
               and s.program = p.program
         group by d.snapshot_date, p.program, p.sort_order, u.names
     ),
-    -- Below the line. Counted, never credited to a program. The label is
-    -- composed here so its numbers cannot drift from its own row.
+    -- Below the line. Counted, never credited to a program.
     reconciling_rows as (
         select d.snapshot_date,
                'reconciling'::text,
                '(multi)'::text,
-               format('Multi-program deals, not credited to any single program (%s, $%s)',
-                      count(s.deal_id),
-                      to_char(coalesce(sum(s.amount_home), 0), 'FM999,999,999.00')),
                'measured'::text,
                count(s.deal_id),
                coalesce(sum(s.amount_home), 0),
@@ -136,7 +157,7 @@ as $function$
               and s.program = '(multi)'
         group by d.snapshot_date
     )
-    select snapshot_date, row_type, program, label, measurement,
+    select snapshot_date, row_type, program, measurement,
            sourced_deals, sourced_pipeline, sourced_won, won_deals
     from (select * from program_rows
           union all
@@ -148,13 +169,11 @@ $function$;
 -- ---------------------------------------------------------------------
 -- 3. v_sourced_by_program
 -- ---------------------------------------------------------------------
--- Defined as the function's default-argument call rather than as a second
--- copy of the logic. Two objects answering the same question from two
--- separate bodies is exactly how v_influence_headline drifted from
--- f_influence_headline. This makes that drift impossible here.
---
--- The column list changes, so create-or-replace cannot do it. Drop and
--- recreate, then re-grant.
+-- Nothing reads this view: /overview uses the RPC. So the column-list
+-- change is safe, and defining it as the function's default-argument
+-- call means there is only one body. Two objects answering the same
+-- question from two separate bodies is exactly how v_influence_headline
+-- drifted from f_influence_headline.
 drop view if exists mktg.v_sourced_by_program;
 
 create view mktg.v_sourced_by_program as
@@ -167,10 +186,9 @@ select * from mktg.f_sourced_by_program(true, null);
 -- Signature and return type are unchanged, so create-or-replace is safe
 -- here and the existing privileges survive.
 --
--- The single line that matters is "where row_type = 'program'". Without
--- it this function silently absorbs the new reconciling row, sourced
--- pipeline becomes $11,690,160.95 and share-of-need moves 0.1848 ->
--- 0.2338, contradicting the decision to hold the headline at 148.
+-- The filter is the entire purpose of row_type. Without it this function
+-- silently absorbs the reconciling row and sourced pipeline moves from
+-- $9,237,904.98 to $11,690,160.95 on the close_year = null call.
 create or replace function mktg.f_pipeline_model(
     include_amazon boolean default true,
     close_year     integer default null
@@ -216,28 +234,38 @@ grant execute on function mktg.f_pipeline_model(boolean, integer)     to authent
 
 
 -- =====================================================================
--- Verification. Run after applying. Every figure is the expected value
--- against snapshot 2026-09-02.
+-- VERIFICATION. Run all four before deciding. Expected values are for
+-- snapshot 2026-09-02. Any miss means rollback, not an edit to the SQL.
 -- =====================================================================
--- select row_type, program, measurement, sourced_deals, sourced_pipeline,
---        sourced_won, won_deals
---   from mktg.f_sourced_by_program(true, null);
---
+
+-- (a) shape and per-program figures
+select row_type, program, measurement, sourced_deals, sourced_pipeline,
+       sourced_won, won_deals
+  from mktg.f_sourced_by_program(true, null);
 --   program      Content & Technology  measured       134  8646483.89  668815.29  49
 --   program      Events                measured        14   591421.09   66210.41   4
 --   program      Advertising           not_measured     0        0.00       0.00   0
 --   program      PR & Brand            measured         0        0.00       0.00   0
 --   reconciling  (multi)               measured        42  2452255.97   41942.04   5
---
 --   5 rows, no (unclassified)
---
--- select sum(sourced_deals), sum(sourced_pipeline)
---   from mktg.f_sourced_by_program(true, null) where row_type = 'program';
---   -> 148, 9237904.98
---
--- select sourced_pipeline, sourced_share_of_need
---   from mktg.f_pipeline_model(true, null);
---   -> 9237904.98, 0.1847580996        (unchanged, which is the point)
---
--- select count(*) from mktg.v_sourced_by_program;
---   -> 5
+
+-- (b) the headline is unchanged above the line
+select sum(sourced_deals) as deals, sum(sourced_pipeline) as pipeline
+  from mktg.f_sourced_by_program(true, null)
+ where row_type = 'program';
+--   148, 9237904.98
+
+-- (c) f_pipeline_model, close_year null
+select sourced_pipeline, sourced_share_of_need
+  from mktg.f_pipeline_model(true, null);
+--   9237904.98, 0.1847580996
+
+-- (d) f_pipeline_model, close_year 2027. THIS is the call /overview's
+--     Progress to 2027 Target tile actually makes, and its numbers are
+--     not the same as (c). Both have to hold.
+select sourced_pipeline, sourced_share_of_need
+  from mktg.f_pipeline_model(true, 2027);
+--   5003533.00, 0.10007066
+
+-- commit;
+-- rollback;

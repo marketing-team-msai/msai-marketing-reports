@@ -9,6 +9,19 @@ functions own all aggregation.
 - `is_single_program` is false for uninfluenced (null program) and
   multi-program deals. All sourced-pipeline metrics currently exclude both.
   This governs the headline number and was previously undocumented.
+- The contacts-by-stage funnel is COUNTS ONLY. Ratified 2026-09-02.
+  `snap_sourced_contact.influenced_value` was removed rather than fixed.
+  It held the full amount of every Net New deal a contact touched, so two
+  contacts on one deal each carried the whole deal and `sum()` across
+  contacts double counted: 12 deals, $1,129,524.90, none Amazon or Galco.
+  The ETL comment said de-duplication was "the view's job"; the view never
+  did it and could not, because the table has no `deal_id`.
+  An even-split dollar column was considered and rejected: it fixes the
+  number while keeping the shape that caused it. Do not add one back.
+  The funnel answers "where do marketing-sourced contacts sit", a count
+  question, and is captioned directional-only anyway because HubSpot
+  auto-advances and skips stages. Dollars stay at deal grain, on Overview
+  and Influence, where the dedupe is proven exact to the cent.
 
 ## Gotchas
 
@@ -65,6 +78,18 @@ of `generate_report.py` and false of the daily sync.
 
 Paid attribution has a path, but only through the unbuilt `snap_ad_source`
 leg. Nothing in the Campaign Influence lists carries it.
+
+## Open items
+
+- Every logged-in employee can read all of `mktg` directly. `authenticated`
+  holds SELECT on all 12 tables and all 8 views, and the `/auth` gate
+  auto-confirms any `@multisensorai.com` address. Not for fixing now, but
+  it is a wider read surface than anyone specified.
+- The actual read path is undocumented. `SETUP.md:430` describes an anon
+  key plus a read-only policy for named views. What is deployed is the
+  publishable key plus a signed-in user's JWT, so PostgREST runs as
+  `authenticated` and reads whatever that role is granted. `anon` holds no
+  grants at all, so the documented setup would see nothing.
 
 ## Working agreement
 
