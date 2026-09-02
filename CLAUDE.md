@@ -25,6 +25,10 @@ functions own all aggregation.
   "could not choose the best candidate function." Always
   `drop function if exists` the old signature first.
 - Any `--only` run overwrites the whole-day `run_log` summary.
+- `docs/schema.sql` is a GENERATED dump of every `mktg` view and function.
+  Read it instead of asking for the DDL to be run by hand. It is not applied
+  by anything, so it goes stale silently: refresh it whenever a migration
+  lands. The regeneration query is in its header.
 
 ## Population reconciliation (snapshot 2026-09-02)
 
@@ -35,7 +39,32 @@ snap_sourced_deal: 861 deals / $49,154,033.88 total, splitting as
     multi-program:                    42 / $2,452,255.97
 
 snap_influence: 359 rows / 228 distinct deals / $11,842,231.76
-snap_sourced_contact: 4,296 | snap_lead_sla: 7,213 | over SLA: 72
+snap_sourced_contact: 4,297 | snap_lead_sla: 7,213 | over SLA: 72
+
+snap_sourced_contact was recorded as 4,296. Re-counted live: 4,297 rows,
+4,297 distinct contact_id.
+
+## Ad source / Windsor
+
+Windsor is NOT decommissioned, and it is NOT wired into the mktg pipeline.
+Both halves matter:
+
+- `pull_windsor()` still exists in `generate_report.py` and is still called by
+  that script's standalone workbook run. The code path is live.
+- `sync_to_mktg.py` never calls it and never writes `snap_ad_source`. The
+  workflow's generated `config.env` carries no `WINDSOR_*`, so a scheduled run
+  has no key and pulls nothing.
+- `config.env.example` still documents `WINDSOR_API_KEY` and
+  `WINDSOR_DATE_PRESET`, and a local `config.env` may still carry the key.
+- `mktg.snap_ad_source` and `mktg.v_ad_performance` exist and hold 0 rows.
+
+So the accurate status is: the ETL leg is unbuilt, not retired. Do not write
+"Windsor is no longer pulled" - it reads as decommissioned and it is not.
+README.md still describes the pipeline as HubSpot plus Windsor, which is true
+of `generate_report.py` and false of the daily sync.
+
+Paid attribution has a path, but only through the unbuilt `snap_ad_source`
+leg. Nothing in the Campaign Influence lists carries it.
 
 ## Working agreement
 
