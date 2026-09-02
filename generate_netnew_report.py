@@ -418,8 +418,24 @@ def build_dataset():
         sourced_contacts=sourced_contacts, src_props=src_props,
     )
 
-def compute_deal_grain(ds):
-    """Reproduce slide 15: single-program sourced deals per program, ex-Amazon, Galco isolated."""
+def compute_slide15_grain(ds):
+    """Reproduce slide 15 of the July 2026 ELT offsite deck. NOT a general
+    deal classifier.
+
+    The exclusions below are deliberate reproductions of how that slide was
+    drawn, and they are no longer how the business defines sourced:
+
+      - Amazon deals are dropped entirely
+      - Galco deals are diverted into their own bucket rather than counted
+        against a program
+
+    That rule has since been overturned. Anything that needs to know whether a
+    deal is sourced should read d["single_program"] from build_dataset, which
+    classifies every deal on its own merits with no company test. Using this
+    function for that purpose understates sourced pipeline - it hid $4.39M
+    across 10 deals when the mktg sync briefly relied on it.
+
+    Kept only so the workbook can still reproduce the historical slide."""
     deals = ds["deals"]
     prog = {p: {"deals": 0, "sourced": 0.0, "won": 0.0, "won_deals": 0} for p in PROGRAMS}
     galco = {"deals": 0, "sourced": 0.0, "won": 0.0}
@@ -752,7 +768,9 @@ def main():
     global dg_sourced, dg_share
     gen_date = datetime.now(timezone.utc)
     ds = build_dataset()
-    dg = compute_deal_grain(ds)
+    # Historical slide-15 reproduction, with its own intentional exclusions.
+    # Not a general sourced-deal classifier - see the docstring.
+    dg = compute_slide15_grain(ds)
     camp_rows, n_prod = compute_campaign_summary(ds, dg)
     funnel, funnel_total = compute_contact_funnel(ds)
 

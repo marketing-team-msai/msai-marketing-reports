@@ -555,7 +555,7 @@ def run_netnew(snapshot_date, generated_at, dry_run=False, sample=2):
 
     # Sourced is decided per deal on its own merits: exactly the deals whose
     # influenced contacts all fall in one program. Deliberately NOT taken from
-    # compute_deal_grain, which reproduces the old slide-15 view and drops
+    # compute_slide15_grain, which reproduces the old slide-15 view and drops
     # Amazon while diverting Galco into a separate bucket - an exclusion that
     # has since been overturned. is_single_program already implies influenced,
     # since a deal with no influenced contacts has an empty program set.
