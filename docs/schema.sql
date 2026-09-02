@@ -18,6 +18,9 @@
 -- Tables are NOT in here. The column contract for the snap_* tables is
 -- COLUMNS in sync_to_mktg.py, which --check-schema diffs against the
 -- live schema.
+--
+-- Captured after the 2026-09-02 migrations. v_influence_headline and
+-- v_sourced_contacts_by_stage were dropped; see docs/migrations/.
 -- =====================================================================
 
 -- ============================== FUNCTIONS ==============================
@@ -57,13 +60,15 @@ CREATE OR REPLACE FUNCTION mktg.f_pipeline_model(include_amazon boolean DEFAULT 
 AS $function$
     with cfg as (
         select
-          max(case when key='target_2027' then value::numeric end)          as target_2027,
+          max(case when key='target_2027' then value::numeric end)            as target_2027,
           max(case when key='assigned_win_rate_2027' then value::numeric end) as assigned_wr
         from config_settings
     ),
     sourced as (
         select snapshot_date, sum(sourced_pipeline) as sourced_pipeline
-        from f_sourced_by_program(include_amazon, close_year) group by snapshot_date
+        from f_sourced_by_program(include_amazon, close_year)
+        where row_type = 'program'
+        group by snapshot_date
     )
     select
         s.snapshot_date, s.sourced_pipeline, c.target_2027, c.assigned_wr,
@@ -76,34 +81,88 @@ $function$
 -- f_sourced_by_program
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION mktg.f_sourced_by_program(include_amazon boolean DEFAULT true, close_year integer DEFAULT NULL::integer)
- RETURNS TABLE(snapshot_date date, program text, sourced_deals bigint, sourced_pipeline numeric, sourced_won numeric, won_deals bigint)
+ RETURNS TABLE(snapshot_date date, row_type text, program text, measurement text, sourced_deals bigint, sourced_pipeline numeric, sourced_won numeric, won_deals bigint)
  LANGUAGE sql
  STABLE
  SET search_path TO 'mktg'
 AS $function$
-    select
-        snapshot_date,
-        coalesce(program, '(unclassified)'),
-        count(*) filter (where is_single_program),
-        sum(amount_home) filter (where is_single_program),
-        sum(amount_home) filter (where is_single_program and is_closed_won),
-        count(*) filter (where is_single_program and is_closed_won)
-    from snap_sourced_deal
-    where (include_amazon or not is_amazon)
-      and (close_year is null or extract(year from close_date) = close_year)
-    group by snapshot_date, coalesce(program, '(unclassified)');
+    with scope as (
+        select *
+        from snap_sourced_deal
+        where (include_amazon or not is_amazon)
+          and (close_year is null or extract(year from close_date) = close_year)
+    ),
+    days as (
+        select distinct snapshot_date from snap_sourced_deal
+    ),
+    programs (program, sort_order) as (
+        values ('Content & Technology', 1),
+               ('Events',               2),
+               ('Advertising',          3),
+               ('PR & Brand',           4)
+    ),
+    unmeasured as (
+        select coalesce(
+                 (select array(select trim(x)
+                                 from unnest(string_to_array(value, ',')) as x)
+                    from config_settings
+                   where key = 'unmeasured_programs'),
+                 '{}'::text[]) as names
+    ),
+    program_rows as (
+        select d.snapshot_date,
+               'program'::text as row_type,
+               p.program,
+               case when p.program = any(u.names)
+                    then 'not_measured' else 'measured' end as measurement,
+               count(s.deal_id)                                              as sourced_deals,
+               coalesce(sum(s.amount_home), 0)                               as sourced_pipeline,
+               coalesce(sum(s.amount_home) filter (where s.is_closed_won), 0) as sourced_won,
+               count(s.deal_id) filter (where s.is_closed_won)               as won_deals,
+               p.sort_order
+        from days d
+        cross join programs p
+        cross join unmeasured u
+        left join scope s
+               on s.snapshot_date = d.snapshot_date
+              and s.is_single_program
+              and s.program = p.program
+        group by d.snapshot_date, p.program, p.sort_order, u.names
+    ),
+    reconciling_rows as (
+        select d.snapshot_date,
+               'reconciling'::text,
+               '(multi)'::text,
+               'measured'::text,
+               count(s.deal_id),
+               coalesce(sum(s.amount_home), 0),
+               coalesce(sum(s.amount_home) filter (where s.is_closed_won), 0),
+               count(s.deal_id) filter (where s.is_closed_won),
+               9
+        from days d
+        left join scope s
+               on s.snapshot_date = d.snapshot_date
+              and s.program = '(multi)'
+        group by d.snapshot_date
+    )
+    select snapshot_date, row_type, program, measurement,
+           sourced_deals, sourced_pipeline, sourced_won, won_deals
+    from (select * from program_rows
+          union all
+          select * from reconciling_rows) x
+    order by snapshot_date, sort_order;
 $function$
 
 -- ---------------------------------------------------------------------
 -- f_sourced_contacts_by_stage
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION mktg.f_sourced_contacts_by_stage(include_amazon boolean DEFAULT true)
- RETURNS TABLE(snapshot_date date, lifecycle_stage text, sourced_contacts bigint, influenced_value numeric)
+ RETURNS TABLE(snapshot_date date, lifecycle_stage text, sourced_contacts bigint)
  LANGUAGE sql
  STABLE
  SET search_path TO 'mktg', 'public', 'pg_temp'
 AS $function$
-    select snapshot_date, lifecycle_stage, count(*), sum(influenced_value)
+    select snapshot_date, lifecycle_stage, count(*)
     from snap_sourced_contact
     where not is_internal and (include_amazon or not is_amazon)
     group by snapshot_date, lifecycle_stage;
@@ -181,21 +240,6 @@ create or replace view mktg.v_influence_by_campaign as
   GROUP BY pdc.snapshot_date, pdc.campaign_id, pdc.campaign_name, pdc.campaign_type, cpc.influenced_contacts;
 
 -- ---------------------------------------------------------------------
--- v_influence_headline
--- ---------------------------------------------------------------------
-create or replace view mktg.v_influence_headline as
- SELECT s.snapshot_date,
-    count(DISTINCT s.deal_id) AS total_deals,
-    count(DISTINCT s.deal_id) FILTER (WHERE NOT s.is_internal) AS deals_clean,
-    sum(distinct_amount.amount_home) AS influenced_pipeline
-   FROM mktg.snap_influence s
-     JOIN LATERAL ( SELECT DISTINCT ON (s2.deal_id) s2.amount_home
-           FROM mktg.snap_influence s2
-          WHERE s2.snapshot_date = s.snapshot_date AND s2.deal_id = s.deal_id) distinct_amount ON true
-  WHERE NOT s.is_internal AND NOT s.is_storefront
-  GROUP BY s.snapshot_date;
-
--- ---------------------------------------------------------------------
 -- v_latest_snapshot
 -- ---------------------------------------------------------------------
 create or replace view mktg.v_latest_snapshot as
@@ -234,22 +278,11 @@ create or replace view mktg.v_sla_by_status as
 -- ---------------------------------------------------------------------
 create or replace view mktg.v_sourced_by_program as
  SELECT snapshot_date,
-    COALESCE(program, '(unclassified)'::text) AS program,
-    count(*) FILTER (WHERE is_single_program) AS sourced_deals,
-    sum(amount_home) FILTER (WHERE is_single_program) AS sourced_pipeline,
-    sum(amount_home) FILTER (WHERE is_single_program AND is_closed_won) AS sourced_won,
-    count(*) FILTER (WHERE is_single_program AND is_closed_won) AS won_deals
-   FROM mktg.snap_sourced_deal
-  GROUP BY snapshot_date, (COALESCE(program, '(unclassified)'::text));
-
--- ---------------------------------------------------------------------
--- v_sourced_contacts_by_stage
--- ---------------------------------------------------------------------
-create or replace view mktg.v_sourced_contacts_by_stage as
- SELECT snapshot_date,
-    lifecycle_stage,
-    count(*) AS sourced_contacts,
-    sum(influenced_value) AS influenced_value
-   FROM mktg.snap_sourced_contact
-  WHERE NOT is_internal
-  GROUP BY snapshot_date, lifecycle_stage;
+    row_type,
+    program,
+    measurement,
+    sourced_deals,
+    sourced_pipeline,
+    sourced_won,
+    won_deals
+   FROM mktg.f_sourced_by_program(true, NULL::integer) f_sourced_by_program(snapshot_date, row_type, program, measurement, sourced_deals, sourced_pipeline, sourced_won, won_deals);
