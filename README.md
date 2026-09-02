@@ -7,9 +7,14 @@ schedule, with no one running anything by hand and no machine that has to be
 switched on.
 
 It is plain automation. There is no AI in the data path and it costs nothing
-to run. It reads data from tools the company already pays for (HubSpot and
-Windsor.ai), builds Excel workbooks, uploads them to object storage, and writes a row of
-numbers to Postgres. That is the whole job.
+to run. It reads data from HubSpot, builds Excel workbooks, uploads them to
+object storage, and writes a row of numbers to Postgres. That is the whole job.
+
+Windsor.ai is a second source, but only for the standalone
+`generate_report.py` run, which pulls ad spend when given a key. The daily
+sync into the `mktg` schema does not touch it: `sync_to_mktg.py` never calls
+`pull_windsor()`, the workflow passes no `WINDSOR_*`, and `snap_ad_source`
+exists with 0 rows. That ETL leg is unbuilt, not retired. See CLAUDE.md.
 
 Publishing to the Marketing SharePoint site is still supported and still in the
 code, but it is off by default, because it is the only part that needs a
