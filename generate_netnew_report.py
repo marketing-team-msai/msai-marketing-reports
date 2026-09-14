@@ -11,10 +11,17 @@ Two grains (both from Alecia's own definitions in her SharePoint docs):
 
   DEAL grain  (the load-bearing offsite view, slide 15 "H1 2026 Marketing
               Attribution by Program"):
-     Sourced = SINGLE-PROGRAM (marketing-originated proxy). A deal is
-     "sourced" by a program when EVERY marketing campaign that touched any of
-     its associated contacts maps to exactly ONE program bucket
+     SINGLE-PROGRAM INFLUENCED. A deal is single-program influenced by a
+     program when EVERY marketing campaign that touched any of its associated
+     contacts maps to exactly ONE program bucket
      (Content & Technology / Events / Advertising / PR & Brand).
+     This identifies single-program INFLUENCE, not opportunity origin: the
+     rule says nothing about which touch came first or caused the deal. It
+     was previously labelled "sourced / marketing-originated proxy", which
+     claimed more than it measures. The arithmetic is unchanged and it
+     remains a supporting metric; the headline is unique influenced deals.
+     See mktg.f_influenced_pipeline and docs/migrations/
+     2026-09-14_influenced_pipeline_by_program.sql.
      Scope: Net New Pipeline (id 813739955), Amazon EXCLUDED, Galco ISOLATED.
 
   CONTACT grain (board deck "Net New (Marketing Sourced) Report",
@@ -532,16 +539,19 @@ def build_workbook(ds, dg, camp_rows, n_prod, funnel, funnel_total, gen_date):
 
     # ---- Tab 1: Executive Summary ----
     ws = wb.active; ws.title = "Exec Summary"
-    ws.cell(1, 1, "MSAI Marketing Net-New / Sourced Pipeline Report").font = F_TITLE
+    ws.cell(1, 1, "MSAI Marketing Net-New / Influenced Pipeline Report").font = F_TITLE
     for c in range(1, 8):
         ws.cell(1, c).fill = C_TITLE
     meta = ("Generated: %s  |  Live HubSpot pull  |  Net New Pipeline (id %s)  |  Created since %s  |  "
-            "Amazon excluded, Galco isolated  |  Sourced = single-program (marketing-originated proxy)"
+            "Amazon excluded, Galco isolated  |  Single-program influenced pipeline "
+            "(single-program influence, not opportunity origin)"
             % (gen_date.strftime("%B %d, %Y"), NET_NEW_PIPELINE_ID, SINCE))
     ws.cell(2, 1, meta).font = Font(italic=True, size=9, color="595959")
 
-    kpi_hdr = ["Sourced Deals (single-program)", "Sourced Pipeline $ (ex-Galco)",
-               "Sourced Closed-Won $", "Sourced Contacts (net-new)",
+    kpi_hdr = ["Single-Program Influenced Deals",
+               "Single-Program Influenced Pipeline $ (ex-Galco)",
+               "Single-Program Influenced Closed-Won $",
+               "Marketing-Engaged Contacts (net-new)",
                "Reached MQL+", "Closed-Won Deals", "Galco (isolated) $"]
     mql_plus = sum(n for st, lab, n in funnel
                    if st in ("marketingqualifiedlead", "157687207", "salesqualifiedlead",
@@ -555,8 +565,9 @@ def build_workbook(ds, dg, camp_rows, n_prod, funnel, funnel_total, gen_date):
         cell = ws.cell(5, c, v); cell.font = F_KPI_VAL
         cell.number_format = USD if c in (2, 3, 7) else '#,##0'
 
-    ws.cell(7, 1, "SOURCED PIPELINE BY PROGRAM (single-program, ex-Galco)").font = F_SECTION
-    _hdr(ws, 8, ["Program", "Sourced Deals", "Sourced Pipeline $", "Closed-Won $",
+    ws.cell(7, 1, "SINGLE-PROGRAM INFLUENCED PIPELINE BY PROGRAM (ex-Galco)").font = F_SECTION
+    _hdr(ws, 8, ["Program", "Influenced Deals", "Influenced Pipeline $",
+                 "Closed-Won $",
                  "Won Deals", "Directional Cost/Deal note"],
          [26, 16, 20, 18, 12, 34])
     r = 9
@@ -582,12 +593,12 @@ def build_workbook(ds, dg, camp_rows, n_prod, funnel, funnel_total, gen_date):
     r += 2
     ws.cell(r, 1, "HOW TO READ THIS REPORT").font = F_SECTION; r += 1
     how = [
-        ("Tab 2 - Sourced Contacts Detail", "Every marketing-sourced net-new contact (created since %s, member of a Campaign Influence list), its lifecycle stage and any associated net-new deal." % SINCE),
-        ("Tab 3 - Source / Campaign Summary", "Marketing programs and campaigns ranked by sourced pipeline. A deal is 'sourced' by a program when all its influencing campaigns map to that one program (single-program rule)."),
-        ("Tab 4 - Funnel / Lifecycle Position", "Where the marketing-sourced contacts sit in the lifecycle. Directional only: HubSpot stage assignment is not a validated funnel (auto-advancement, stage-skipping)."),
+        ("Tab 2 - Marketing-Engaged Contacts Detail", "Every net-new contact created since %s that is a member of a Campaign Influence list, its lifecycle stage and any associated net-new deal. List membership is the engagement test; it is not evidence the contact originated the deal." % SINCE),
+        ("Tab 3 - Program / Campaign Summary", "Marketing programs and campaigns ranked by single-program influenced pipeline. A deal counts for a program when ALL its influencing campaigns map to that one program. Deals touched by two programs are excluded from every program row here and are reported separately: see mktg.f_influenced_by_program and f_influenced_by_combination."),
+        ("Tab 4 - Funnel / Lifecycle Position", "Where the marketing-engaged contacts sit in the lifecycle. Directional only: HubSpot stage assignment is not a validated funnel (auto-advancement, stage-skipping)."),
         ("Tab 5 - Pipeline Model", "The offsite math: 2026 $14M / 2027 $30M targets, Amazon ~70% / non-Amazon ~30% close rates, pipeline needed, and how much marketing is sourcing today."),
         ("Tab 6 - Confirmations", "The specific definition choices that still need Alecia's sign-off before this is treated as canonical."),
-        ("Definition", "Sourced / net-new = marketing-ORIGINATED (single-program proxy), distinct from 'influenced' = any campaign touch. Scope: Net New Pipeline, Amazon excluded, Galco isolated."),
+        ("Definition", "Single-program influenced = every campaign touching the deal maps to ONE program. It measures influence concentration, NOT opportunity origin. 'Influenced' = any campaign touch. Scope: Net New Pipeline, Amazon excluded, Galco isolated."),
     ]
     for a, b in how:
         ws.cell(r, 1, a).font = Font(bold=True, size=10)
@@ -598,7 +609,7 @@ def build_workbook(ds, dg, camp_rows, n_prod, funnel, funnel_total, gen_date):
         ws.column_dimensions[col].width = 20
 
     # ---- Tab 2: Sourced Contacts Detail ----
-    ws = wb.create_sheet("Sourced Contacts Detail")
+    ws = wb.create_sheet("Marketing-Engaged Contacts")
     _hdr(ws, 1, ["Contact Name", "Email", "Create Date", "Lifecycle Stage",
                  "Campaign(s) (marketing source)", "# Campaigns", "Program(s)"],
          [24, 32, 12, 22, 60, 12, 24])
@@ -623,10 +634,11 @@ def build_workbook(ds, dg, camp_rows, n_prod, funnel, funnel_total, gen_date):
     ws.freeze_panes = "A2"; ws.auto_filter.ref = "A1:G%d" % (r - 1)
 
     # ---- Tab 3: Source / Campaign Summary ----
-    ws = wb.create_sheet("Source-Campaign Summary")
-    ws.cell(1, 1, "Sourced pipeline by PROGRAM (single-program, ex-Galco)").font = F_SECTION
-    _hdr(ws, 2, ["Program", "Sourced Deals", "Sourced Pipeline $", "Closed-Won $", "Won Deals"],
-         [26, 16, 20, 18, 12])
+    ws = wb.create_sheet("Program-Campaign Summary")
+    ws.cell(1, 1, "Single-program influenced pipeline by PROGRAM (ex-Galco)").font = F_SECTION
+    _hdr(ws, 2, ["Program", "Influenced Deals", "Influenced Pipeline $",
+                 "Closed-Won $", "Won Deals"],
+         [26, 16, 22, 18, 12])
     r = 3
     for p in sorted(PROGRAMS, key=lambda p: -prog[p]["sourced"]):
         ws.cell(r, 1, p).font = Font(bold=True)

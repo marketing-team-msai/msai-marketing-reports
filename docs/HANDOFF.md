@@ -222,12 +222,82 @@ report's numbers. Hit twice now. Re-running all three is the workaround.
 **(d) `snap_sourced_deal` rename, deferred.** The name says sourced; the
 table holds the full Net New population.
 
-**(e) The `(multi)` bucket.** 43 genuinely marketing-influenced deals worth
-$2,931,048.04 are credited to no single program and so appear in no
-program-level total. `f_sourced_by_program` surfaces them as a
-`row_type = 'reconciling'` row, and the new deal list has a Multi-program
-filter, so they are now visible in two places. Whether they should be
-attributed differently is still an open question.
+**(e) The `(multi)` bucket, settled 2026-09-14.** Staged in
+`docs/migrations/2026-09-14_influenced_pipeline_by_program.sql`, NOT YET
+APPLIED.
+
+The data reframed the question. Every multi-program deal touches exactly TWO
+programs: 41 are Content & Technology + Events ($2,907,483.04), 2 are
+Content & Technology + PR & Brand ($23,565.00). Across all 114 influenced
+Net New deals, Content is present on 97%, Events 39%, PR & Brand 2%,
+Advertising 0%.
+
+So the single-program rule was not mis-attributing evenly. It was hiding
+Events specifically. Events touches 44 deals worth $3,109,583.04, of which
+only 3 worth $202,100.00 appeared in any program total, because Events
+almost never occurs without Content and Content is on nearly everything.
+94% of Events-touched pipeline was invisible.
+
+Alecia's decision: count each deal once in the headline, show participation
+per program without splitting dollars, and make the overlap explicit. No
+re-attribution, no new sourcing model, and Events is NOT promoted to source
+just because Content is common. Four new objects:
+
+    f_influenced_pipeline        each deal ONCE. row_type total /
+                                 single_program / multi_program
+    f_influenced_by_program      full deal value to every program that
+                                 touched it. NOT ADDITIVE
+    f_influenced_by_combination  mutually exclusive, reconciles exactly
+    v_influenced_deal_detail     drill-through, deal x contact x campaign
+    v_deal_program               the dedupe grain under all of it
+
+Reconciliation, verified live rather than hard-coded:
+
+    single-program    71 deals   $6,602,745.04
+    multi-program     43 deals   $2,931,048.04
+    total            114 deals   $9,533,793.08
+    ex-Amazon        107 deals   $9,169,843.49
+
+Participation, which does NOT sum: Content 111 / $9,331,693.08, Events 44 /
+$3,109,583.04, PR & Brand 2 / $23,565.00, Advertising 0 / not_measured. Rows
+total $12,464,841.12 against a true $9,533,793.08, so any overall figure has
+to come from `f_influenced_pipeline`.
+
+The dedupe is load-bearing. Naive summing over `snap_influence` rows gives
+$39,354,872.17; deduped at deal x program it is $12,464,841.12; unique deals
+$9,533,793.08. 61 of the 157 (deal, program) pairs are backed by more than
+one row.
+
+**Terminology.** The single-program rule identifies single-program
+INFLUENCE, not opportunity origin, and is now labelled "Single-program
+influenced pipeline". The workbook labels in `generate_netnew_report.py`
+were changed - 14 display strings, no calculation, no dict key, no column
+name. `f_sourced_by_program`'s columns were deliberately NOT renamed because
+the Lovable dashboard reads `sourced_deals` and `sourced_pipeline` by name.
+**The label change still has to be applied in `msa-dash-pro`**; this repo
+cannot do it. Labels are in `config_settings` so the dashboard reads them
+live.
+
+**Even split untouched.** `even_split_value` and `f_influence_by_campaign`
+keep their exact behaviour, relabelled "Allocated influenced pipeline - even
+split". Equal splitting is deliberately not used for participation.
+
+**Scope.** The new objects are Net New only; `snap_influence` is
+portal-wide, and 22 of its 136 deals are dropped. Their totals will not
+match `f_influence_by_campaign` and that is correct.
+
+**Two sources of truth, flagged not fixed.** `config_program_keywords` is
+the SQL mirror of `classify_program()`. Verified identical on 2026-09-14 -
+11/18/6 keywords, same eval order, zero disagreements across all 29 campaign
+names - and it will drift. Query 2.8 in the migration is the alarm.
+
+Logic verified before staging, since the migration cannot be run from here:
+each body transliterated to SQLite, run over the real rows, diffed against
+expectations derived independently in Python. All three functions matched on
+both Amazon toggles, combinations reconciled to the headline in deals and
+dollars, and the two properties the spec named were tested by injecting
+synthetic rows - an extra contact, and an extra campaign, inside a program a
+deal already had. Neither moved any program's dollars.
 
 **(f) No retention policy.** `snap_lead_sla` is 93,937 rows across all
 snapshots and grows about 7,200 a day. Nothing prunes.
@@ -324,11 +394,15 @@ session. Let one finish before starting the other.
 
 ## Next
 
-1. Apply `docs/migrations/2026-09-14_f_close_rate.sql` and run its PASTE 2,
-   then regenerate `docs/schema.sql`. Nothing reads the function yet, so
-   applying it changes no page.
-2. Decide (e), whether multi-program deals should be attributed rather than
-   only reconciled. This is the live question after (b) was settled.
+1. Apply both staged migrations and run their PASTE 2 blocks:
+   `2026-09-14_f_close_rate.sql` and
+   `2026-09-14_influenced_pipeline_by_program.sql`. Then regenerate
+   `docs/schema.sql`. Nothing reads either yet, so applying them changes no
+   page.
+2. Build the influenced-pipeline section in `msa-dash-pro`, and apply the
+   "Single-program influenced pipeline" label there. Read the labels from
+   `config_settings`, do not hard-code. One instruction at a time - the
+   Lovable queue is shared.
 3. The Lead SLA page is built but has not been reviewed. Given 34 Qualified
    contacts over 90 days, it is the page most likely to prompt action.
 4. Decide whether the `--check-schema` negative-test harness should live in
@@ -337,6 +411,9 @@ session. Let one finish before starting the other.
    2026-09-14. The workflow's own secret is fine - `run_log` is `status=ok`
    with 0 failed reports every day through 09-14 - so this affects local
    runs of the generators only, not the daily sync.
+6. Consider folding `config_program_keywords` and `classify_program()` into
+   one source. Every other two-sources-of-truth pair on this project has
+   diverged eventually.
 
 Done since: extending `--check-schema`, item (h); settling `snap_close_rate`,
-item (b).
+item (b); settling the `(multi)` bucket, item (e).

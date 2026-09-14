@@ -35,6 +35,57 @@ functions own all aggregation.
   that reads this function must too. There is no `amount_home` column.
   `v_sourced_by_program` is `select * from f_sourced_by_program(true, null)`,
   deliberately one body so the two cannot drift.
+- INFLUENCED PIPELINE IS COUNTED THREE WAYS AND ONLY ONE OF THEM SUMS.
+  `f_influenced_pipeline` is the headline: each deal ONCE, 114 /
+  $9,533,793.08 on 2026-09-14, with `row_type` `single_program` 71 and
+  `multi_program` 43 summing back to it. `f_influenced_by_combination` is
+  mutually exclusive, so its rows also sum to that exactly.
+  `f_influenced_by_program` DOES NOT SUM: each program carries the full value
+  of every deal it touched, so its four rows total $12,464,841.12 against a
+  true $9,533,793.08. Take totals from `f_influenced_pipeline`, never by
+  adding program rows. Caption from
+  `config_settings.label_influenced_by_program`.
+- `v_deal_program` is the dedupe grain everything influenced is built on:
+  distinct `(snapshot_date, deal_id, program)`, 157 pairs backed by 248
+  detail rows, 61 of them multi-row. Summing `snap_influence` rows instead
+  gives $39,354,872.17 against a true $9,533,793.08. Do not add a summable
+  column to `v_deal_program`, and do not build a dollar figure by summing
+  `snap_influence`. `v_influenced_deal_detail` repeats `amount_home` on every
+  row by design - it is for listing who and what touched a deal, never for
+  dollars.
+- The influenced-pipeline objects are NET NEW ONLY; `snap_influence` and
+  `f_influence_by_campaign` are PORTAL-WIDE. `snap_influence` holds 136
+  distinct deals on 2026-09-14, of which 22 are not Net New and are dropped.
+  Their totals will not match and that is correct. Match the filters before
+  comparing anything.
+- `config_program_keywords` is the SQL mirror of `classify_program()` in
+  `generate_netnew_report.py`. TWO SOURCES OF TRUTH, verified identical
+  2026-09-14 (11/18/6 keywords, same eval order, zero disagreements across
+  all 29 campaign names) and certain to drift eventually. Query 2.8 in
+  `docs/migrations/2026-09-14_influenced_pipeline_by_program.sql` is the
+  alarm: it checks the SQL classification against the stored
+  `is_single_program` on every deal. Run it after any keyword change.
+- `snap_influence.campaign_type` is NOT the program. It is HubSpot's own
+  taxonomy (Content, Event, Webinar, Form, Whitepaper, Video, Case Study, PR)
+  and cuts a different way. Program comes only from `classify_program()` /
+  `config_program_keywords` over `campaign_name`.
+- The single-program rule measures single-program INFLUENCE, not opportunity
+  origin. Its display label is "Single-program influenced pipeline", carried
+  in `config_settings.label_single_program`. The workbook labels in
+  `generate_netnew_report.py` were changed 2026-09-14; the CALCULATION and
+  every column name in `f_sourced_by_program` were deliberately left alone,
+  because the Lovable dashboard reads `sourced_deals` and `sourced_pipeline`
+  by name. The label change still has to be applied in `msa-dash-pro`.
+- Every multi-program deal touches exactly TWO programs, 41 of 43 being
+  Content & Technology + Events. Content is on 97% of influenced deals,
+  Events 39%, PR & Brand 2%, Advertising 0%. So the single-program rule was
+  not mis-attributing evenly, it was hiding Events: 94% of Events-touched
+  pipeline ($2,907,483.04 of $3,109,583.04) sat in the `(multi)` bucket.
+  Even split was considered and NOT used - a program that touched a deal
+  shows the whole deal in `f_influenced_by_program`, or the row would be an
+  allocation wearing a participation label. `even_split_value` and
+  `f_influence_by_campaign` keep their behaviour and are now labelled
+  "Allocated influenced pipeline - even split".
 - `f_close_rate` is segment-grain and TRIPLE counts across `segment_type`.
   Every closed deal appears once under `'all'`, once under `'amazon'` and
   once under `'vertical'`. 18 rows per snapshot on 2026-09-14; summing all
