@@ -35,6 +35,32 @@ functions own all aggregation.
   that reads this function must too. There is no `amount_home` column.
   `v_sourced_by_program` is `select * from f_sourced_by_program(true, null)`,
   deliberately one body so the two cannot drift.
+- `f_close_rate` is segment-grain and TRIPLE counts across `segment_type`.
+  Every closed deal appears once under `'all'`, once under `'amazon'` and
+  once under `'vertical'`. 18 rows per snapshot on 2026-09-14; summing all
+  of them gives 816 closed / 615 won instead of 272 / 205. Filter on
+  `segment_type`, the same discipline `row_type` needs on
+  `f_sourced_by_program`. `v_close_rate` is `select * from
+  f_close_rate(null)`, one body so the two cannot drift.
+- `f_close_rate` returns TWO rates and they are not interchangeable.
+  `deal_win_rate` is won/closed by count; `dollar_win_rate` is won/(won+lost)
+  by amount. On 2026-09-14 Amazon reads 0.9568 by deal and 0.7186 by dollar -
+  it wins nearly every deal and loses the big ones. Never render either as
+  "close rate" unqualified. Its population is the Net New Pipeline
+  (HubSpot 813739955) create-date cohort: EVERY deal in that pipeline, not
+  only marketing-sourced ones, so these are commercial rates, not marketing
+  rates. Not comparable to the offsite 0.70 / 0.30 in
+  `generate_netnew_report.py` MODEL, which came from a wider book.
+- `measurement` on `f_close_rate` is `below_threshold`, deliberately NOT the
+  `not_measured` that `f_sourced_by_program` uses. `not_measured` means no
+  source is captured; `below_threshold` means captured but under
+  `config_settings.close_rate_min_closed` (20), so both rates are null while
+  counts still show. Same dash on screen, different reasons.
+- `mktg.snap_close_rate` is SUPERSEDED, not unbuilt. It holds 0 rows and
+  nothing writes it. It was segment-grain, which made it an aggregate in a
+  `snap_` table against the rule in `sync_to_mktg.py`'s own docstring, and
+  every input was already in `snap_sourced_deal`. `f_close_rate` replaced it
+  with no ETL leg. Kept rather than dropped; that call is still open.
 - `measurement` is `not_measured` for any program listed in the
   `unmeasured_programs` row of `config_settings`, currently Advertising.
   That zero means "not captured", not "captured and zero", and renders as a

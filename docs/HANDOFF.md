@@ -149,8 +149,71 @@ is unbuilt, not retired. `pull_windsor()` still exists and still runs in
 it and the workflow's `config.env` carries no `WINDSOR_*`. Advertising shows
 `measurement = not_measured` for this reason.
 
-**(b) `snap_close_rate` holds 0 rows** and appears nowhere in CLAUDE.md.
-Either an unbuilt leg like ad source, or orphaned. Nobody has said which.
+**(b) `snap_close_rate` is superseded, decided 2026-09-14.** It was neither
+unbuilt nor orphaned. Its columns are `segment_type / segment_value /
+won_count / lost_count / close_rate`, and `generate_netnew_report.py:115`
+hard-codes `close_rate_amazon 0.70` and `close_rate_non_amazon 0.30` inside
+`MODEL`, lifted from the July 2026 ELT offsite deck. The table was the
+unbuilt home for measured versions of those constants.
+
+It is now replaced by `f_close_rate` + `v_close_rate`, staged in
+`docs/migrations/2026-09-14_f_close_rate.sql` and NOT YET APPLIED. A
+function, not an ETL leg, because the table was segment-grain - an aggregate
+in a `snap_` table, against the rule `sync_to_mktg.py` states in its own
+docstring - and every input was already in `snap_sourced_deal` at deal
+grain. So: no new pull, no daily write, cannot drift from the deal data, and
+it backfills every snapshot already written the moment it lands.
+
+The table is KEPT and documented as superseded. Dropping it is a separate
+call; the down migration does not touch it.
+
+**What the population actually is.** Verified live before writing anything,
+because the labelling depends on it:
+
+- NOT all won and lost opportunities. The ETL filters pipeline EQ
+  813739955, so all 436 rows carry `pipeline = 'Net New Pipeline'`. Other
+  pipelines are absent entirely.
+- NOT marketing-sourced only, which is the likelier misread given the table
+  name. 322 of 436 are uninfluenced, 71 single-program, 43 multi-program.
+  The denominator is every deal in the pipeline, so these are commercial
+  rates, not marketing rates. Do not caption them "marketing sourced".
+- Closed splits exactly: 272 = 205 Closed Won + 67 Closed Lost, no third
+  terminal stage, no null `is_closed_won`. Nothing leaks out of the
+  denominator.
+- It is a CREATE-date cohort, not a close-date window, so it is not
+  comparable to the offsite 0.70 / 0.30 which came from a wider book
+  (425 won / $8.52M against 205 won / $5.89M here).
+
+**Both rates are returned and separately labelled**, because they diverge:
+
+    segment      deal_win_rate   dollar_win_rate
+    All Net New         0.7537            0.6255
+    Amazon              0.9568            0.7186
+    non-Amazon          0.4545            0.4358
+    Dist & Whse         0.9290            0.6890
+
+Amazon wins nearly every deal and loses the larger ones. Its dollar rate,
+0.7186, lands almost exactly on the offsite's 0.70 while its deal rate is
+0.96 - the best available evidence that the offsite constant was
+dollar-weighted. non-Amazon is above its 0.30 on either basis. Neither is
+proof, given the population mismatch.
+
+Segments are `all` + `amazon` + `vertical`, Alecia's call. Only two
+verticals clear the floor: Distribution & Warehousing (169) and Unknown
+(70). The other 13 are n<=11 and come back `below_threshold` with null rates
+and populated counts. Program was rejected as a segment: Content &
+Technology 49, `(multi)` 5, Events 2.
+
+Logic verified before staging, since the migration cannot be run from here:
+the function body was transliterated to SQLite and run over the real 436
+rows, diffed against expectations derived independently in plain Python.
+18/18 rows exact, `won + lost = closed` on every row, all three segment
+types totalling 272 / 205 / $5,886,665.20, `close_year=2026` returning the
+same 272 / 205 and `close_year=2025` returning nothing. PASTE 2 in the
+migration re-asserts all of that against live Postgres.
+
+`docs/schema.sql` still needs regenerating once this is applied. It is a
+generated dump and was deliberately not hand-edited.
 
 **(c) `write_day_log` merge, still deliberately not implemented.** Any
 `--only` run overwrites the whole-day `run_log` summary with just that
@@ -261,11 +324,19 @@ session. Let one finish before starting the other.
 
 ## Next
 
-1. Decide (b), whether `snap_close_rate` is wanted, and (e), whether
-   multi-program deals should be attributed rather than only reconciled.
-2. The Lead SLA page is built but has not been reviewed. Given 34 Qualified
+1. Apply `docs/migrations/2026-09-14_f_close_rate.sql` and run its PASTE 2,
+   then regenerate `docs/schema.sql`. Nothing reads the function yet, so
+   applying it changes no page.
+2. Decide (e), whether multi-program deals should be attributed rather than
+   only reconciled. This is the live question after (b) was settled.
+3. The Lead SLA page is built but has not been reviewed. Given 34 Qualified
    contacts over 90 days, it is the page most likely to prompt action.
-3. Decide whether the `--check-schema` negative-test harness should live in
+4. Decide whether the `--check-schema` negative-test harness should live in
    the repo, and what runs it.
+5. Refresh the HubSpot token in the local `config.env`. It returns 401 as of
+   2026-09-14. The workflow's own secret is fine - `run_log` is `status=ok`
+   with 0 failed reports every day through 09-14 - so this affects local
+   runs of the generators only, not the daily sync.
 
-Done since: (2) extending `--check-schema`, see item (h).
+Done since: extending `--check-schema`, item (h); settling `snap_close_rate`,
+item (b).
