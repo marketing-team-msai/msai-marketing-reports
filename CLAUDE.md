@@ -25,11 +25,12 @@ functions own all aggregation.
 
 ## Gotchas
 
-- `f_sourced_by_program` is program-grain and returns 5 rows, not 148.
-  Four `row_type = 'program'` rows plus one `row_type = 'reconciling'` row
-  for multi-program deals. The headline is
-  `sum(sourced_pipeline) where row_type = 'program'` = 148 / $9,237,904.98.
-  Summing all five rows gives $11,690,160.95 and is wrong. `f_pipeline_model`
+- `f_sourced_by_program` is program-grain: 5 rows PER SNAPSHOT, not a deal
+  count. Four `row_type = 'program'` rows plus one `row_type = 'reconciling'`
+  row for multi-program deals. The headline is
+  `sum(sourced_pipeline) where row_type = 'program'`, which on 2026-09-14 is
+  145 / $8,840,403.98. Summing all five rows adds the reconciling row and is
+  wrong; on 2026-09-14 that gives $11,882,363.95. `f_pipeline_model`
   and the /overview tile and chart all filter on `row_type`; anything new
   that reads this function must too. There is no `amount_home` column.
   `v_sourced_by_program` is `select * from f_sourced_by_program(true, null)`,
@@ -39,7 +40,18 @@ functions own all aggregation.
   That zero means "not captured", not "captured and zero", and renders as a
   dash. Delete the config row when `snap_ad_source` is built. PR & Brand's
   zero is genuine and renders as $0.00.
-- `snap_sourced_deal` holds the FULL Net New population (861 rows), not only
+- EVERY `f_*` function returns rows for EVERY `snapshot_date`, not just the
+  latest. Always filter, and filter SERVER-side: `.rpc(fn, args).eq(
+  "snapshot_date", d)`, or `?snapshot_date=eq.<date>` over HTTP. PostgREST
+  caps every response at 1000 rows and the functions order oldest-snapshot
+  first, so fetching everything and filtering in the browser silently drops
+  the NEWEST snapshot once the payload outgrows the cap - the page then
+  renders empty, or worse shows an older snapshot, while the freshness banner
+  still reads today. Unfiltered, `f_sourced_by_program` currently totals
+  1,909 deals / $116,742,754.74 instead of 145 / $8,840,403.98.
+  Fixed in the dashboard 2026-09-14; the views have the same shape, so
+  anything new that reads them must filter too.
+- `snap_sourced_deal` holds the FULL Net New population (866 rows), not only
   sourced deals. The 148 metric is `where is_single_program = true`, applied
   in the view, not the ETL. Table name is misleading; rename is deferred.
 - `snap_influence` has two dollar columns at row grain. Naive
@@ -55,19 +67,49 @@ functions own all aggregation.
   by anything, so it goes stale silently: refresh it whenever a migration
   lands. The regeneration query is in its header.
 
-## Population reconciliation (snapshot 2026-09-02)
+## Population reconciliation (snapshot 2026-09-14)
 
-snap_sourced_deal: 861 deals / $49,154,033.88 total, splitting as
+Verified live 2026-09-14. These move daily with CRM activity: re-count before
+concluding anything is broken, and see the note below on why totals can fall.
 
-    single-program (the 148 metric): 148 / $9,237,904.98
-    uninfluenced (null program):     671 / $37,463,872.93  [389 are Amazon]
-    multi-program:                    42 / $2,452,255.97
+snap_sourced_deal: 866 deals / $44,914,165.00 total, splitting as
 
-snap_influence: 359 rows / 228 distinct deals / $11,842,231.76
-snap_sourced_contact: 4,297 | snap_lead_sla: 7,213 | over SLA: 72
+    single-program (the headline metric): 145 / $8,840,403.98
+    uninfluenced (null program):          675 / $33,031,801.05  [390 are Amazon]
+    multi-program:                         46 / $3,041,959.97
 
-snap_sourced_contact was recorded as 4,296. Re-counted live: 4,297 rows,
-4,297 distinct contact_id.
+snap_influence: 422 rows / 231 distinct deals / $12,046,458.76
+snap_sourced_contact: 4,406 | snap_lead_sla: 7,230 | over SLA: 60
+
+`f_sourced_contacts_by_stage` totals 4,388, not 4,406: it excludes the 18
+`is_internal` contacts. That gap is by design, not a miscount.
+
+The population total can FALL between snapshots without anything being wrong.
+Deals disappear from the window when they are deleted or merged in HubSpot,
+not only when their amount changes. Between 09-02 and 09-08 two AWS LHR95
+deals worth $4,400,000 and $248,444 left the population entirely, which is
+most of the drop from $49.15M to $44.91M. Nothing surfaces this, so a total
+that moves by millions overnight needs a deal-level diff, not a bug hunt.
+
+For the record, 2026-09-02 was: 861 deals / $49,154,033.88, single-program
+148 / $9,237,904.98, uninfluenced 671 / $37,463,872.93, multi-program
+42 / $2,452,255.97; snap_influence 359 rows / 228 deals / $11,842,231.76.
+
+## Cross-table drilldown
+
+`snap_influence` and `snap_sourced_deal` are NOT comparable as totals -
+portal-wide versus Net New only - but they DO join cleanly on
+(snapshot_date, deal_id) for deal-level detail. Verified 2026-09-14: all 145
+single-program and all 46 multi-program deals appear in `snap_influence`,
+100% of both. So any Net New deal that is influenced can show its contacts
+and campaigns by joining across.
+
+The 675 uninfluenced deals have no rows in `snap_influence` by definition.
+That is the correct answer to "which campaigns touched this deal", not a gap.
+
+One caveat when showing dollars in such a drilldown: `even_split_value` is
+computed across the portal-wide influence population, so those shares do not
+sum to sourced pipeline and must not be presented as if they do.
 
 ## Ad source / Windsor
 
