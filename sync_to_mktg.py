@@ -48,6 +48,8 @@ Usage
   python sync_to_mktg.py --selftest         builders vs COLUMNS, no network
   python sync_to_mktg.py --check-schema     our columns, conflict targets,
                                             foreign keys and types vs live
+  python sync_to_mktg.py --sync-keywords    reconcile config_program_keywords
+                                            to generate_netnew_report.py, network
   python sync_to_mktg.py --dry-run --sample 5   compute, print 5 rows, write nothing
   python sync_to_mktg.py --only influence   one report
   python sync_to_mktg.py                    all three
@@ -229,6 +231,34 @@ def sb_upsert(table, rows, dry_run=False, sample=2):
         sent += len(batch)
     print("     ok     %s: %d row(s)" % (table, sent))
     return sent
+
+
+def sb_patch(table, filter_query, fields):
+    """Update rows matching filter_query (e.g. "id=eq.7"). For targeted edits
+    outside the upsert-by-primary-key path - config_program_keywords has no
+    natural key to upsert on, only a surrogate id, so reconciling it means
+    patching specific rows by id rather than upserting."""
+    url = "%s/rest/v1/%s?%s" % (SB_URL, table, filter_query)
+    _request(url, method="PATCH", body=json.dumps(fields, default=str).encode(),
+             headers={
+                 "apikey": SB_KEY,
+                 "Authorization": "Bearer " + SB_KEY,
+                 "Content-Type": "application/json",
+                 "Content-Profile": SCHEMA,
+                 "Prefer": "return=minimal",
+             })
+
+
+def sb_delete(table, filter_query):
+    """Delete rows matching filter_query. Used only by keyword reconciliation
+    below - nothing else in this script deletes."""
+    url = "%s/rest/v1/%s?%s" % (SB_URL, table, filter_query)
+    _request(url, method="DELETE", headers={
+        "apikey": SB_KEY,
+        "Authorization": "Bearer " + SB_KEY,
+        "Content-Profile": SCHEMA,
+        "Prefer": "return=minimal",
+    })
 
 
 # ------------------------------------------------------------- run_log -------
@@ -622,6 +652,86 @@ def run_sla(snapshot_date, generated_at, dry_run=False, sample=2):
     return headline, n
 
 
+# --------------------------------------------------- program keywords sync ---
+def program_keyword_rows():
+    """Canonical (program, keyword, eval_order) rows, read straight from
+    netnew.PROGRAM_KEYWORDS - the single place this mapping is defined now.
+    Content & Technology carries no rows: it is classify_program()'s
+    fallback, and the live table has never had rows for it either.
+
+    Raises if a keyword appears under two programs. classify_program() checks
+    programs in a fixed order and would silently prefer the first match, so a
+    collision here would make the two implementations agree with each other
+    but disagree with what a human reading the keyword list would expect -
+    worth failing loudly on rather than reconciling silently."""
+    rows = []
+    seen = {}
+    for program, eval_order, keywords in netnew.PROGRAM_KEYWORDS:
+        for kw in keywords:
+            if kw in seen:
+                raise ValueError(
+                    "keyword %r listed under both %r and %r in "
+                    "PROGRAM_KEYWORDS - every keyword must belong to exactly "
+                    "one program" % (kw, seen[kw], program))
+            seen[kw] = program
+            rows.append({"program": program, "keyword": kw,
+                        "eval_order": eval_order})
+    return rows
+
+
+def sync_program_keywords(dry_run=False):
+    """Reconcile mktg.config_program_keywords to exactly match
+    netnew.PROGRAM_KEYWORDS: add missing keywords, remove retired ones, patch
+    any whose program or eval_order changed. Idempotent - a table already in
+    sync reports zero changes and writes nothing.
+
+    keyword is the natural key here even though the table's only real
+    constraint is a surrogate id primary key, so this reconciles by id rather
+    than upserting: insert the additions, patch changed rows by id, delete
+    retired rows by id - instead of one on_conflict upsert."""
+    canonical = {r["keyword"]: r for r in program_keyword_rows()}
+    current = {r["keyword"]: r for r in
+              sb_select("config_program_keywords",
+                       "select=id,program,keyword,eval_order")}
+
+    to_add = [canonical[k] for k in canonical if k not in current]
+    to_remove = [current[k] for k in current if k not in canonical]
+    to_update = [(current[k]["id"], canonical[k]) for k in canonical
+                if k in current
+                and (current[k]["program"], current[k]["eval_order"])
+                    != (canonical[k]["program"], canonical[k]["eval_order"])]
+
+    print("config_program_keywords: %d live, %d canonical"
+          % (len(current), len(canonical)))
+    for r in to_add:
+        print("     add    %-14s %s" % (r["program"], r["keyword"]))
+    for r in to_remove:
+        print("     remove %-14s %s" % (r["program"], r["keyword"]))
+    for _id, r in to_update:
+        old = current[r["keyword"]]
+        print("     update %-30s (%s, %s) -> (%s, %s)"
+              % (r["keyword"], old["program"], old["eval_order"],
+                 r["program"], r["eval_order"]))
+
+    changes = len(to_add) + len(to_remove) + len(to_update)
+    if not changes:
+        print("     ok     already in sync")
+        return 0
+    if dry_run:
+        print("     dry    %d change(s), nothing written" % changes)
+        return changes
+
+    if to_add:
+        sb_upsert("config_program_keywords", to_add)
+    for _id, r in to_update:
+        sb_patch("config_program_keywords", "id=eq.%s" % _id,
+                {"program": r["program"], "eval_order": r["eval_order"]})
+    for r in to_remove:
+        sb_delete("config_program_keywords", "id=eq.%s" % r["id"])
+    print("     ok     %d change(s) applied" % changes)
+    return changes
+
+
 # -------------------------------------------------------- schema check -------
 # PostgREST advertises the Postgres type of every column as `format`, and marks
 # primary and foreign keys inside `description`. These are the Python types a
@@ -955,12 +1065,23 @@ def main():
                          "and types against the live mktg schema, then exit")
     ap.add_argument("--selftest", action="store_true",
                     help="verify builders match COLUMNS using fixtures, then exit")
+    ap.add_argument("--sync-keywords", action="store_true",
+                    help="reconcile mktg.config_program_keywords to match "
+                         "generate_netnew_report.PROGRAM_KEYWORDS, then exit")
     args = ap.parse_args()
 
     if args.selftest:
         sys.exit(_selftest())
     if args.check_schema:
         sys.exit(check_schema())
+    if args.sync_keywords:
+        init_creds()
+        if not args.dry_run:
+            _require_creds()
+        else:
+            print("DRY RUN - computing the keyword diff, writing nothing")
+        sync_program_keywords(dry_run=args.dry_run)
+        sys.exit(0)
 
     init_creds()
     if not args.dry_run:

@@ -172,23 +172,40 @@ def since_ms():
 # slide 15. Advertising tested first (paid overrides), then Events, then PR,
 # else Content & Technology (the workhorse catch-all: content, webinar,
 # whitepaper, video, blog, fact sheet, pillar page, forms, case studies).
-ADV_KW = ("paid", "ppc", "google ads", "linkedin ad", "meta paid", "display",
-          "banner ad", "abx linkedin", "linkedin ab", "boost", "retargeting")
-EVENT_KW = ("conference", "summit", "live event", "booth", "tradeshow", "trade show",
-            "expo", "modex", "maintec", "euromaintenance", "marcon", "bindt",
-            "reliable plant", "reliability conference", "supplychainpoint",
-            "data center world", "mainstream", "attendees")
-PR_KW = ("pr:", "press", "investor", "g2 crowd", "earned media", "media banner")
+#
+# THE SINGLE SOURCE. mktg.config_program_keywords in Postgres used to be a
+# hand-maintained mirror of this - two copies of the same rule, verified
+# identical by hand on 2026-09-14 and certain to drift eventually. As of the
+# same day, it no longer is: `sync_to_mktg.py --sync-keywords` reads
+# PROGRAM_KEYWORDS below and reconciles the table to match it exactly,
+# add/update/remove. Edit keywords ONLY here. The table is a generated mirror,
+# not a second place to make this decision - the SQL views that classify
+# programs (v_deal_program and everything built on it) read the table because
+# a view cannot call Python, not because the table is independently
+# authoritative.
+#
+# eval_order matches f_sourced_by_program's precedence and is exported to the
+# table as-is; classify_program() below is independent of it and just checks
+# in the order the tuple lists them, which happens to agree.
+PROGRAM_KEYWORDS = (
+    ("Advertising", 1,
+     ("paid", "ppc", "google ads", "linkedin ad", "meta paid", "display",
+      "banner ad", "abx linkedin", "linkedin ab", "boost", "retargeting")),
+    ("Events", 2,
+     ("conference", "summit", "live event", "booth", "tradeshow", "trade show",
+      "expo", "modex", "maintec", "euromaintenance", "marcon", "bindt",
+      "reliable plant", "reliability conference", "supplychainpoint",
+      "data center world", "mainstream", "attendees")),
+    ("PR & Brand", 3,
+     ("pr:", "press", "investor", "g2 crowd", "earned media", "media banner")),
+)
 
 def classify_program(name):
     n = name.lower()
     n = n.replace("campaign influence:", "").replace("campaign influence :", "").strip()
-    if any(k in n for k in ADV_KW):
-        return "Advertising"
-    if any(k in n for k in EVENT_KW):
-        return "Events"
-    if any(k in n for k in PR_KW):
-        return "PR & Brand"
+    for program, _eval_order, keywords in PROGRAM_KEYWORDS:
+        if any(k in n for k in keywords):
+            return program
     return "Content & Technology"
 
 PROGRAMS = ["Content & Technology", "Events", "Advertising", "PR & Brand"]

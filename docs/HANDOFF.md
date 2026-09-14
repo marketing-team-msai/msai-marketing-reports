@@ -349,6 +349,14 @@ auto-confirms any `@multisensorai.com` address. Wider than anyone specified.
 anchor and the SLA thresholds both live in a config table the dashboard reads
 AND in environment values the ETL reads. Both diverged. When changing any
 number of this kind, change every place at once and check the DB table too.
+The keyword-to-program mapping was the same bug in a different shape - not a
+scalar duplicated in two places, but a 35-row list hand-copied into
+`config_program_keywords`. That one was fixed structurally instead of by
+convention: `PROGRAM_KEYWORDS` in `generate_netnew_report.py` is now the only
+place it's written, and `sync_to_mktg.py --sync-keywords` (in the daily
+workflow) makes the table catch up automatically rather than asking a human
+to remember. Worth asking, next time two places hold the same fact, whether
+auto-reconciliation is possible before reaching for "document it and hope."
 
 **Exposing a schema in Supabase Settings > API grants no privileges.** It adds
 the schema to PostgREST's search path. Postgres grants are separate, and a
@@ -395,30 +403,63 @@ instructions to `msa-dash-pro`, they interleave and the agent may action the
 wrong one or drop into plan mode mid-task. It happened three times in this
 session. Let one finish before starting the other.
 
+## Program keyword consolidation (2026-09-14)
+
+`config_program_keywords` and `classify_program()` were two hand-maintained
+copies of the same 35-keyword rule, flagged as certain to drift in the prior
+section of this document. Folded into one source the same day.
+
+`generate_netnew_report.py` now defines `PROGRAM_KEYWORDS`, a single tuple of
+`(program, eval_order, keywords)`, and `classify_program()` iterates it
+instead of checking three separately-declared tuples. Verified byte-identical
+behavior against the old three-tuple implementation across 15 test names
+before removing it, including edge cases (empty string, mixed case, the
+`campaign influence:` prefix). `program_keyword_rows()` in `sync_to_mktg.py`
+reads `PROGRAM_KEYWORDS` and asserts no keyword appears under two programs -
+would raise loudly, not merge silently, since classify_program()'s
+first-match-wins order would otherwise hide a real conflict.
+
+`sync_to_mktg.py --sync-keywords` reconciles `mktg.config_program_keywords`
+to that tuple: reads the live table, diffs by keyword (the natural key; the
+table's only real constraint is a surrogate `id`), and inserts additions,
+patches changed rows by id, deletes retired rows by id. Idempotent - a table
+already in sync reports zero changes and writes nothing, verified by running
+it twice in a row. Wired into the daily workflow as its own step, right after
+`--check-schema`, with `continue-on-error: true`: this is drift prevention,
+not report delivery, so a transient write failure here should never block
+the day's actual reports, and the next day's run repairs it regardless.
+
+Verified live end-to-end before this was considered done, not just against
+fixtures: monkeypatched `PROGRAM_KEYWORDS` in-process (no file touched) to
+add a throwaway keyword, ran the real sync against Postgres, confirmed the
+insert; changed its program/eval_order, confirmed the patch; removed it,
+confirmed the delete and that the table came back **byte-for-byte identical**
+to its pre-test state; ran it once more to confirm zero further changes; and
+confirmed the cross-program uniqueness guard actually raises. 11 checks, 0
+failures, table restored and reverified.
+
+The still-useful separate check, query 2.8 in
+`docs/migrations/2026-09-14_influenced_pipeline_by_program.sql`, is
+unaffected and still worth running after any keyword change: it verifies
+`v_deal_program`'s classification against the stored `is_single_program` on
+every deal, which would catch a bug in the view itself, not only a stale
+table - a class of error `--sync-keywords` cannot see since it never reads
+`v_deal_program`.
+
 ## Next
 
-1. Regenerate `docs/schema.sql`. Both migrations are applied, so the dump is
-   stale: it is still captured as of the 2026-09-02 migrations and is missing
-   `f_influence_by_campaign`, `f_close_rate`, `v_close_rate`,
-   `v_deal_program`, the three `f_influenced_*` functions and
-   `v_influenced_deal_detail`. The regeneration query is in that file's
-   header and has to be run in the SQL editor, because PostgREST cannot
-   return DDL.
-2. Build the influenced-pipeline section in `msa-dash-pro`, and apply the
-   "Single-program influenced pipeline" label there. Read the labels from
-   `config_settings`, do not hard-code. One instruction at a time - the
-   Lovable queue is shared.
-3. The Lead SLA page is built but has not been reviewed. Given 34 Qualified
+1. The Lead SLA page is built but has not been reviewed. Given 34 Qualified
    contacts over 90 days, it is the page most likely to prompt action.
-4. Decide whether the `--check-schema` negative-test harness should live in
-   the repo, and what runs it.
-5. Refresh the HubSpot token in the local `config.env`. It returns 401 as of
+2. Decide whether the `--check-schema` negative-test harness (and now the
+   `--sync-keywords` end-to-end harness) should live in the repo, and what
+   runs them. Neither is checked in; both need live credentials and there is
+   no test runner here yet.
+3. Refresh the HubSpot token in the local `config.env`. It returns 401 as of
    2026-09-14. The workflow's own secret is fine - `run_log` is `status=ok`
    with 0 failed reports every day through 09-14 - so this affects local
    runs of the generators only, not the daily sync.
-6. Consider folding `config_program_keywords` and `classify_program()` into
-   one source. Every other two-sources-of-truth pair on this project has
-   diverged eventually.
 
 Done since: extending `--check-schema`, item (h); settling `snap_close_rate`,
-item (b); settling the `(multi)` bucket, item (e).
+item (b); settling the `(multi)` bucket, item (e); regenerating
+`docs/schema.sql`; building the influenced-pipeline dashboard section;
+folding `config_program_keywords` into `PROGRAM_KEYWORDS`.

@@ -58,13 +58,21 @@ functions own all aggregation.
   distinct deals on 2026-09-14, of which 22 are not Net New and are dropped.
   Their totals will not match and that is correct. Match the filters before
   comparing anything.
-- `config_program_keywords` is the SQL mirror of `classify_program()` in
-  `generate_netnew_report.py`. TWO SOURCES OF TRUTH, verified identical
-  2026-09-14 (11/18/6 keywords, same eval order, zero disagreements across
-  all 29 campaign names) and certain to drift eventually. Query 2.8 in
-  `docs/migrations/2026-09-14_influenced_pipeline_by_program.sql` is the
-  alarm: it checks the SQL classification against the stored
-  `is_single_program` on every deal. Run it after any keyword change.
+- `config_program_keywords` is a GENERATED MIRROR of
+  `generate_netnew_report.PROGRAM_KEYWORDS`, not a second source. It was two
+  independently hand-maintained copies until 2026-09-14, verified identical
+  that day, and certain to have drifted eventually. Now `sync_to_mktg.py
+  --sync-keywords` reconciles the table to the Python tuple exactly -
+  add/update/remove by keyword - and the daily workflow runs it every day
+  (`continue-on-error`, so a transient write failure there never blocks the
+  day's actual reports). Edit keywords ONLY in `PROGRAM_KEYWORDS`; the table
+  will catch up on the next run, or immediately via
+  `python sync_to_mktg.py --sync-keywords`. `program_keyword_rows()` raises
+  if a keyword is ever listed under two programs. Query 2.8 in
+  `docs/migrations/2026-09-14_influenced_pipeline_by_program.sql` is a
+  separate, still-useful check: it verifies the SQL classification against
+  the stored `is_single_program` end to end, which catches a bug in
+  `v_deal_program` itself, not only a stale table.
 - `snap_influence.campaign_type` is NOT the program. It is HubSpot's own
   taxonomy (Content, Event, Webinar, Form, Whitepaper, Video, Case Study, PR)
   and cuts a different way. Program comes only from `classify_program()` /

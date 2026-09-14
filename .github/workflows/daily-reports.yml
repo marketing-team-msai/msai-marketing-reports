@@ -64,6 +64,18 @@ jobs:
       - name: Check schema
         run: python sync_to_mktg.py --check-schema
 
+      # Reconciles mktg.config_program_keywords to
+      # generate_netnew_report.PROGRAM_KEYWORDS, the single source for the
+      # campaign -> program mapping. Runs every day so the SQL mirror the
+      # views read (v_deal_program and everything built on it) can never
+      # silently drift from the Python rule again. continue-on-error because
+      # this is drift *prevention*, not report delivery - a transient write
+      # failure here should not block the day's actual reports, and the next
+      # day's run repairs it either way.
+      - name: Sync program keywords
+        continue-on-error: true
+        run: python sync_to_mktg.py --sync-keywords
+
       - name: Sync to mktg
         run: |
           ARGS=""
