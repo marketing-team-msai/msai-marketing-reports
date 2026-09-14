@@ -156,9 +156,9 @@ hard-codes `close_rate_amazon 0.70` and `close_rate_non_amazon 0.30` inside
 `MODEL`, lifted from the July 2026 ELT offsite deck. The table was the
 unbuilt home for measured versions of those constants.
 
-It is now replaced by `f_close_rate` + `v_close_rate`, staged in
-`docs/migrations/2026-09-14_f_close_rate.sql` and NOT YET APPLIED. A
-function, not an ETL leg, because the table was segment-grain - an aggregate
+It is now replaced by `f_close_rate` + `v_close_rate`, in
+`docs/migrations/2026-09-14_f_close_rate.sql`, APPLIED AND VERIFIED LIVE
+2026-09-14. A function, not an ETL leg, because the table was segment-grain - an aggregate
 in a `snap_` table, against the rule `sync_to_mktg.py` states in its own
 docstring - and every input was already in `snap_sourced_deal` at deal
 grain. So: no new pull, no daily write, cannot drift from the deal data, and
@@ -204,16 +204,14 @@ verticals clear the floor: Distribution & Warehousing (169) and Unknown
 and populated counts. Program was rejected as a segment: Content &
 Technology 49, `(multi)` 5, Events 2.
 
-Logic verified before staging, since the migration cannot be run from here:
-the function body was transliterated to SQLite and run over the real 436
-rows, diffed against expectations derived independently in plain Python.
-18/18 rows exact, `won + lost = closed` on every row, all three segment
-types totalling 272 / 205 / $5,886,665.20, `close_year=2026` returning the
-same 272 / 205 and `close_year=2025` returning nothing. PASTE 2 in the
-migration re-asserts all of that against live Postgres.
-
-`docs/schema.sql` still needs regenerating once this is applied. It is a
-generated dump and was deliberately not hand-edited.
+Verified twice. Before applying, the body was transliterated to SQLite and
+run over the real 436 rows against expectations derived independently in
+Python. After applying, every figure was re-checked against live Postgres
+over PostgREST: 18 rows, the three headline segments to the cent, the floor
+suppressing 13 of 15 verticals with their counts still populated,
+`won + lost = closed` everywhere, all three segment types totalling
+272 / 205, the 816 / 615 triple count, `close_year` both ways, and
+`v_close_rate` identical to the function.
 
 **(c) `write_day_log` merge, still deliberately not implemented.** Any
 `--only` run overwrites the whole-day `run_log` summary with just that
@@ -222,9 +220,9 @@ report's numbers. Hit twice now. Re-running all three is the workaround.
 **(d) `snap_sourced_deal` rename, deferred.** The name says sourced; the
 table holds the full Net New population.
 
-**(e) The `(multi)` bucket, settled 2026-09-14.** Staged in
-`docs/migrations/2026-09-14_influenced_pipeline_by_program.sql`, NOT YET
-APPLIED.
+**(e) The `(multi)` bucket, settled 2026-09-14.** In
+`docs/migrations/2026-09-14_influenced_pipeline_by_program.sql`, APPLIED AND
+VERIFIED LIVE 2026-09-14.
 
 The data reframed the question. Every multi-program deal touches exactly TWO
 programs: 41 are Content & Technology + Events ($2,907,483.04), 2 are
@@ -291,13 +289,18 @@ the SQL mirror of `classify_program()`. Verified identical on 2026-09-14 -
 11/18/6 keywords, same eval order, zero disagreements across all 29 campaign
 names - and it will drift. Query 2.8 in the migration is the alarm.
 
-Logic verified before staging, since the migration cannot be run from here:
-each body transliterated to SQLite, run over the real rows, diffed against
-expectations derived independently in Python. All three functions matched on
-both Amazon toggles, combinations reconciled to the headline in deals and
-dollars, and the two properties the spec named were tested by injecting
-synthetic rows - an extra contact, and an extra campaign, inside a program a
-deal already had. Neither moved any program's dollars.
+Verified twice. Before applying, each body was transliterated to SQLite and
+run over the real rows against expectations derived independently in Python,
+including the two properties the spec named: injecting an extra contact, and
+an extra campaign, into a program a deal already had moved no program's
+dollars. After applying, everything was re-checked against live Postgres -
+all three functions on both Amazon toggles, combinations reconciling to the
+headline in deals and dollars, 157 distinct pairs behind 248 detail rows,
+the 22 portal-wide deals correctly dropped, and the drift alarm clean.
+
+56 checks across both migrations, 0 failures. `f_sourced_by_program` still
+returns 71 / $6,602,745.04 and `snap_close_rate` is still empty, so nothing
+that existed before this moved.
 
 **(f) No retention policy.** `snap_lead_sla` is 93,937 rows across all
 snapshots and grows about 7,200 a day. Nothing prunes.
@@ -394,11 +397,13 @@ session. Let one finish before starting the other.
 
 ## Next
 
-1. Apply both staged migrations and run their PASTE 2 blocks:
-   `2026-09-14_f_close_rate.sql` and
-   `2026-09-14_influenced_pipeline_by_program.sql`. Then regenerate
-   `docs/schema.sql`. Nothing reads either yet, so applying them changes no
-   page.
+1. Regenerate `docs/schema.sql`. Both migrations are applied, so the dump is
+   stale: it is still captured as of the 2026-09-02 migrations and is missing
+   `f_influence_by_campaign`, `f_close_rate`, `v_close_rate`,
+   `v_deal_program`, the three `f_influenced_*` functions and
+   `v_influenced_deal_detail`. The regeneration query is in that file's
+   header and has to be run in the SQL editor, because PostgREST cannot
+   return DDL.
 2. Build the influenced-pipeline section in `msa-dash-pro`, and apply the
    "Single-program influenced pipeline" label there. Read the labels from
    `config_settings`, do not hard-code. One instruction at a time - the
