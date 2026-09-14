@@ -62,24 +62,58 @@ functions own all aggregation.
   "could not choose the best candidate function." Always
   `drop function if exists` the old signature first.
 - Any `--only` run overwrites the whole-day `run_log` summary.
+- The sync UPSERTS and never deletes. Narrowing the window, or anything else
+  that shrinks the population, leaves the dropped rows in place in snapshots
+  already written. They are invisible to `--check-schema` and to the run
+  output, and the views keep aggregating them, so the dashboard goes on
+  showing the old figure while `run_log_reports.metrics` shows the new one.
+  The next day's run is unaffected: it writes a new `snapshot_date` and is
+  clean. Only the already-written snapshot needs a delete.
 - `docs/schema.sql` is a GENERATED dump of every `mktg` view and function.
   Read it instead of asking for the DDL to be run by hand. It is not applied
   by anything, so it goes stale silently: refresh it whenever a migration
   lands. The regeneration query is in its header.
 
-## Population reconciliation (snapshot 2026-09-14)
+## Window anchor
 
-Verified live 2026-09-14. These move daily with CRM activity: re-count before
-concluding anything is broken, and see the note below on why totals can fall.
+2026-01-01, set 2026-09-14. Until then the ETL pulled from 2025-06-01 while
+`config_settings.window_anchor_netnew` said 2026-01-01, so every caption
+reading "Deals created since January 1, 2026" was false and every headline
+was computed over about twice the population the label implied - 431 of 866
+Net New deals predated the stated window.
 
-snap_sourced_deal: 866 deals / $44,914,165.00 total, splitting as
+The anchor is now 2026-01-01 in all four places: `DEALS_CREATED_SINCE` in the
+workflow, `config.env.example`, and the module defaults in
+`generate_report.py` and `generate_netnew_report.py`. It already read
+2026-01-01 in `config_settings`, which is what the dashboard displays, so the
+five now agree. Change all of them together or they will drift again.
 
-    single-program (the headline metric): 145 / $8,840,403.98
-    uninfluenced (null program):          675 / $33,031,801.05  [390 are Amazon]
-    multi-program:                         46 / $3,041,959.97
+Snapshots from 2026-09-02 to 2026-09-14 were written under the old anchor and
+still hold the wider population. A trend across that boundary shows a step
+down that is a definition change, not a business event. See
+`docs/migrations/2026-09-14_window_anchor_2026_cleanup.sql`.
 
-snap_influence: 422 rows / 231 distinct deals / $12,046,458.76
-snap_sourced_contact: 4,406 | snap_lead_sla: 7,230 | over SLA: 60
+## Population reconciliation (snapshot 2026-09-14, window 2026-01-01)
+
+Verified live 2026-09-14 after the anchor change. These move daily with CRM
+activity: re-count before concluding anything is broken, and see the note
+below on why totals can fall.
+
+snap_sourced_deal: 436 deals / $33,755,615.79 total, splitting as
+
+    single-program (the headline metric):  71 / $6,602,745.04
+    uninfluenced (null program):          322 / $24,221,822.71  [215 are Amazon]
+    multi-program:                         43 / $2,931,048.04
+
+snap_influence: 291 rows / 136 distinct deals / $9,603,916.76
+snap_sourced_contact: 4,143 | snap_lead_sla: 7,230 | over SLA: 60
+
+Under the old 2025-06-01 anchor the same snapshot read: 866 deals /
+$44,914,165.00, sourced 145 / $8,840,403.98, uninfluenced 675 /
+$33,031,801.05, multi-program 46 / $3,041,959.97; snap_influence 422 rows /
+231 deals / $12,046,458.76. Moving the anchor cut sourced pipeline 25% and
+influenced pipeline 20%. Neither set was wrong arithmetic; they answer
+different questions.
 
 `f_sourced_contacts_by_stage` totals 4,388, not 4,406: it excludes the 18
 `is_internal` contacts. That gap is by design, not a miscount.

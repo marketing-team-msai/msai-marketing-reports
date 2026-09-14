@@ -7,7 +7,7 @@ Reproduces the 5-tab Excel workbook and adds an
 ad-source (Windsor.ai) leg. Pure code: the entire data pull, workbook, chart,
 runs with zero language-model calls in the hot path.
 
-Universe: live HubSpot pull, portal 20335613. Deals created since 2025-06-01,
+Universe: live HubSpot pull, portal 20335613. Deals created since 2026-01-01,
 all pipelines, all stages. Influence = membership in the HubSpot "Campaign
 Influence" folder segment lists. Attribution = even-split.
 
@@ -60,7 +60,7 @@ CFG = {}
 HS_TOKEN = None
 PORTAL = "20335613"
 FOLDER_ID = "240016304"
-SINCE = "2025-06-01"
+SINCE = "2026-01-01"
 WINDSOR_KEY = ""
 WINDSOR_PRESET = "last_365d"
 OUTDIR = os.path.join(HERE, "output")
@@ -81,7 +81,7 @@ def init(path=None, make_outdir=True):
                            "to this script, or export it in the environment.")
     PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
     FOLDER_ID = CFG.get("CAMPAIGN_INFLUENCE_FOLDER_ID", "240016304")
-    SINCE = CFG.get("DEALS_CREATED_SINCE", "2025-06-01")
+    SINCE = CFG.get("DEALS_CREATED_SINCE", "2026-01-01")
     WINDSOR_KEY = CFG.get("WINDSOR_API_KEY", "")
     WINDSOR_PRESET = CFG.get("WINDSOR_DATE_PRESET", "last_365d")
     HH = {"Authorization": "Bearer " + HS_TOKEN, "Content-Type": "application/json"}

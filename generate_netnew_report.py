@@ -20,12 +20,13 @@ Two grains (both from Alecia's own definitions in her SharePoint docs):
   CONTACT grain (board deck "Net New (Marketing Sourced) Report",
               "Marketing Generated CRM population" bucketed by Lifecycle Stage):
      Reproduced here as a defensible, reproducible proxy: a contact CREATED
-     since 2025-06-01 that is a member of at least one "Campaign Influence"
+     since 2026-01-01 that is a member of at least one "Campaign Influence"
      segment list, positioned by lifecycle stage. FLAGGED: Alecia's exact
      board population may be a specific saved list; confirm before adopting as
      canonical (see the Confirmations tab).
 
-Window: created since 2025-06-01 (matches the influence report).
+Window: created since 2026-01-01 (matches the influence report and
+mktg.config_settings.window_anchor_netnew).
 Influence source: the same "Campaign Influence" folder segment lists the
 influence report uses (HubSpot Marketing Pro has no native attribution API).
 
@@ -74,7 +75,7 @@ def load_config(path=None):
 CFG = {}
 HS_TOKEN = None
 PORTAL = "20335613"
-SINCE = "2025-06-01"
+SINCE = "2026-01-01"
 NET_NEW_PIPELINE_ID = "813739955"
 OUTDIR = os.path.join(HERE, "output")
 HS = "https://api.hubapi.com"
@@ -92,7 +93,7 @@ def init(path=None, make_outdir=True):
         raise RuntimeError("HUBSPOT_TOKEN is not set. Put it in config.env next "
                            "to this script, or export it in the environment.")
     PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
-    SINCE = CFG.get("DEALS_CREATED_SINCE", "2025-06-01")
+    SINCE = CFG.get("DEALS_CREATED_SINCE", "2026-01-01")
     NET_NEW_PIPELINE_ID = CFG.get("NET_NEW_PIPELINE_ID", "813739955")
     HH = {"Authorization": "Bearer " + HS_TOKEN, "Content-Type": "application/json"}
     if make_outdir:
@@ -746,7 +747,7 @@ def build_workbook(ds, dg, camp_rows, n_prod, funnel, funnel_total, gen_date):
          "for the offsite deck."),
         ("Model figures", "Confirm the model tab uses $14M (2026) / $30M (2027), Amazon ~70% / "
          "non-Amazon ~30% close rates, ~60% assigned for 2027 sizing (superseding the old $10M / 23%)."),
-        ("Window", "Confirm 2025-06-01 anchor (matches the influence report and the close-rate basis)."),
+        ("Window", "Confirm 2026-01-01 anchor (matches the influence report and the close-rate basis)."),
     ]
     _hdr(ws, 3, ["Item", "Detail"], [26, 110])
     r = 4
