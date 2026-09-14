@@ -117,7 +117,7 @@ def _sla_days(key, default):
 # Defaults stand until init() reads the configured thresholds.
 SLA_DAYS = {
     "In Progress": 14.0,
-    "Qualified": 14.0,
+    "Qualified": 30.0,
     "Awaiting Sales Qualification": 1.0,
 }
 SLA_FROM_CONFIG = {
@@ -140,7 +140,7 @@ def init(path=None, make_outdir=True):
                            "to this script, or export it in the environment.")
     PORTAL = CFG.get("HUBSPOT_PORTAL_ID", "20335613")
     _ip, _ip_set = _sla_days("SLA_DAYS_IN_PROGRESS", 14)
-    _q, _q_set = _sla_days("SLA_DAYS_QUALIFIED", 14)
+    _q, _q_set = _sla_days("SLA_DAYS_QUALIFIED", 30)
     _a, _a_set = _sla_days("SLA_DAYS_AWAITING_SALES_QUALIFICATION", 1)
     SLA_DAYS = {
         "In Progress": _ip,
