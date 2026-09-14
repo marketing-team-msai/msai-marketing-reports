@@ -69,6 +69,16 @@ functions own all aggregation.
   showing the old figure while `run_log_reports.metrics` shows the new one.
   The next day's run is unaffected: it writes a new `snapshot_date` and is
   clean. Only the already-written snapshot needs a delete.
+- `--check-schema` now covers four things, not one: column names, the
+  `ON_CONFLICT` target against the real primary key, the foreign keys, and the
+  column types against the rows the builders actually produce. It reads all of
+  that out of the PostgREST OpenAPI spec it was already fetching - `format`
+  carries the Postgres type, and `description` carries `<pk/>` and `<fk .../>`
+  markers. No extra request, no DDL. The type check is fed by `_fixture_rows()`,
+  the same fixtures `--selftest` uses, deliberately: a separate sample would be
+  a second source of truth about what we send. Whatever you add to `COLUMNS`,
+  add to those fixtures, or the new columns pass the name diff and are never
+  type-checked. Still blind to orphan rows and to anything about row content.
 - `docs/schema.sql` is a GENERATED dump of every `mktg` view and function.
   Read it instead of asking for the DDL to be run by hand. It is not applied
   by anything, so it goes stale silently: refresh it whenever a migration

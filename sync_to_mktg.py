@@ -46,7 +46,8 @@ Environment
 Usage
 -----
   python sync_to_mktg.py --selftest         builders vs COLUMNS, no network
-  python sync_to_mktg.py --check-schema     our columns vs the live schema
+  python sync_to_mktg.py --check-schema     our columns, conflict targets,
+                                            foreign keys and types vs live
   python sync_to_mktg.py --dry-run --sample 5   compute, print 5 rows, write nothing
   python sync_to_mktg.py --only influence   one report
   python sync_to_mktg.py                    all three
@@ -55,6 +56,7 @@ Usage
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -264,10 +266,11 @@ def delta(current, prior, keys):
     return out
 
 
-def write_report_log(report, snapshot_date, generated_at, metrics, row_count,
-                     status="ok", dry_run=False):
-    """Per-report detail row. This is what read_prior() reads back next run."""
-    return sb_upsert("run_log_reports", [{
+def row_report_log(report, snapshot_date, generated_at, metrics, row_count,
+                   status="ok"):
+    """The run_log_reports row on its own, so --selftest and --check-schema can
+    inspect it the same way they inspect the snap_* builders."""
+    return {
         "snapshot_date": snapshot_date,
         "report": report,
         "generated_at": generated_at,
@@ -275,7 +278,33 @@ def write_report_log(report, snapshot_date, generated_at, metrics, row_count,
         "row_count": row_count,
         "metrics": metrics,
         "is_seeded": IS_SEEDED,
-    }], dry_run=dry_run)
+    }
+
+
+def row_day_log(snapshot_date, started_at, finished_at=None, status="running",
+                reports_run=0, reports_failed=0, rows_written=0, notes=None):
+    """The run_log row on its own. Same reason as row_report_log: a builder the
+    checks can read without writing anything."""
+    return {
+        "snapshot_date": snapshot_date,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "status": status,
+        "reports_run": reports_run,
+        "reports_failed": reports_failed,
+        "rows_written": rows_written,
+        "notes": notes or None,
+        "is_seeded": IS_SEEDED,
+    }
+
+
+def write_report_log(report, snapshot_date, generated_at, metrics, row_count,
+                     status="ok", dry_run=False):
+    """Per-report detail row. This is what read_prior() reads back next run."""
+    return sb_upsert("run_log_reports",
+                     [row_report_log(report, snapshot_date, generated_at,
+                                     metrics, row_count, status)],
+                     dry_run=dry_run)
 
 
 def open_day_log(snapshot_date, started_at):
@@ -283,17 +312,7 @@ def open_day_log(snapshot_date, started_at):
     run_log.snapshot_date, so the day row has to exist before anything else can
     be written. Opened as "running" here and rewritten with real numbers by
     write_day_log once every report has been attempted."""
-    return sb_upsert("run_log", [{
-        "snapshot_date": snapshot_date,
-        "started_at": started_at,
-        "finished_at": None,
-        "status": "running",
-        "reports_run": 0,
-        "reports_failed": 0,
-        "rows_written": 0,
-        "notes": None,
-        "is_seeded": IS_SEEDED,
-    }])
+    return sb_upsert("run_log", [row_day_log(snapshot_date, started_at)])
 
 
 def write_day_log(snapshot_date, started_at, finished_at, reports_run,
@@ -307,17 +326,11 @@ def write_day_log(snapshot_date, started_at, finished_at, reports_run,
         status = "partial"
     else:
         status = "failed"
-    return sb_upsert("run_log", [{
-        "snapshot_date": snapshot_date,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "status": status,
-        "reports_run": reports_run,
-        "reports_failed": reports_failed,
-        "rows_written": rows_written,
-        "notes": notes or None,
-        "is_seeded": IS_SEEDED,
-    }], dry_run=dry_run)
+    return sb_upsert("run_log",
+                     [row_day_log(snapshot_date, started_at, finished_at,
+                                  status, reports_run, reports_failed,
+                                  rows_written, notes)],
+                     dry_run=dry_run)
 
 
 # ---------------------------------------------------------------- helpers ----
@@ -610,8 +623,69 @@ def run_sla(snapshot_date, generated_at, dry_run=False, sample=2):
 
 
 # -------------------------------------------------------- schema check -------
+# PostgREST advertises the Postgres type of every column as `format`, and marks
+# primary and foreign keys inside `description`. These are the Python types a
+# value may have for each format. None is judged separately, against the spec's
+# `required` list, which is the NOT NULL columns carrying no default.
+FORMAT_TYPES = {
+    "text": (str,),
+    "character varying": (str,),
+    "uuid": (str,),
+    "date": (str,),
+    "timestamp with time zone": (str,),
+    "timestamp without time zone": (str,),
+    "numeric": (int, float),
+    "double precision": (int, float),
+    "real": (int, float),
+    "integer": (int,),
+    "bigint": (int,),
+    "smallint": (int,),
+    "boolean": (bool,),
+    "jsonb": (dict, list, str, int, float, bool),
+    "json": (dict, list, str, int, float, bool),
+    "text[]": (list,),
+    "ARRAY": (list,),
+}
+
+FK_RE = re.compile(r"<fk table='([^']+)' column='([^']+)'/>")
+
+
+def _type_problem(fmt, value):
+    """What is wrong with sending `value` to a column of this Postgres type, or
+    None if nothing is.
+
+    bool is a subclass of int in Python, so boolean and the numeric types have
+    to exclude each other by hand or every bool passes as an integer. Dates and
+    timestamps get their string parsed too: the generators write "" or a label
+    such as "(no history)" where a value is absent, and both are str, so a type
+    test on its own would wave them through into a date column."""
+    allowed = FORMAT_TYPES.get(fmt)
+    if allowed is None:
+        return None
+    if isinstance(value, bool) and bool not in allowed:
+        return "bool"
+    if not isinstance(value, allowed):
+        return type(value).__name__
+    if fmt == "date":
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            return "%r, which is not a date" % value[:30]
+    elif fmt.startswith("timestamp"):
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return "%r, which is not a timestamp" % value[:34]
+    return None
+
+
 def check_schema():
-    """Diff COLUMNS against what the live mktg schema actually has."""
+    """Diff COLUMNS, the conflict targets, the foreign keys and the column
+    types against what the live mktg schema actually has.
+
+    Names alone were not enough. This check passed clean through a conflict
+    target that matched no constraint and through a wrong column type, both of
+    which the spec it already fetches was describing at the time."""
     init_creds()
     _require_creds()
     spec = _request("%s/rest/v1/" % SB_URL, headers={
@@ -649,6 +723,8 @@ def check_schema():
             print("    grant all on tables to service_role;")
         return 1
 
+    fixtures = dict(_fixture_rows())
+
     problems = 0
     for table, cols in COLUMNS.items():
         print("")
@@ -657,7 +733,8 @@ def check_schema():
             print("  MISSING - no such table in this schema")
             problems += 1
             continue
-        actual = set(defs[table].get("properties", {}))
+        props = defs[table].get("properties", {})
+        actual = set(props)
         want = set(cols)
         bad = sorted(want - actual)
         unused = sorted(actual - want)
@@ -668,15 +745,95 @@ def check_schema():
             print("  all %d columns exist" % len(want))
         if unused:
             print("  table also has (we never write): %s" % ", ".join(unused))
+
+        # Conflict target vs the real primary key. A target naming no unique
+        # constraint fails the upsert with a 42P10 that does not name the
+        # table, and it fails at write time, mid-run, after the HubSpot pull.
+        pk = sorted(c for c, pr in props.items()
+                    if "<pk/>" in pr.get("description", ""))
+        target = sorted(c.strip()
+                        for c in (ON_CONFLICT.get(table) or "").split(",")
+                        if c.strip())
+        if not pk:
+            print("  no primary key advertised - upsert cannot merge duplicates")
+            problems += 1
+        elif target != pk:
+            print("  on_conflict %s does NOT match the primary key %s"
+                  % (",".join(target) or "(none set)", ",".join(pk)))
+            problems += 1
+        else:
+            print("  on_conflict matches the primary key (%s)" % ",".join(pk))
+
+        # Foreign keys. The day row has to exist before anything that
+        # references it, and open_day_log only guarantees that for run_log.
+        fks = sorted((c, m[0], m[1]) for c, pr in props.items()
+                     for m in FK_RE.findall(pr.get("description", "")))
+        for col, parent, pcol in fks:
+            print("  fk %s -> %s.%s%s"
+                  % (col, parent, pcol,
+                     " (written first by open_day_log)" if parent == "run_log"
+                     else ""))
+        parents = set(p for _, p, _ in fks)
+        if table != "run_log" and "run_log" not in parents:
+            print("  no foreign key to run_log - the day-row ordering contract "
+                  "does not hold here")
+            problems += 1
+        for parent in sorted(x for x in parents
+                             if x != "run_log" and x in COLUMNS):
+            print("  fk parent %s is written by this script too, and only "
+                  "run_log is written first" % parent)
+            problems += 1
+
+        # NOT NULL columns with no default. Postgres rejects the whole batch.
+        required = set(defs[table].get("required", []))
+        never = sorted(required - want)
+        if never:
+            print("  NOT NULL columns we never send: %s" % ", ".join(never))
+            problems += 1
+
+        # Types, against the rows the builders actually produce.
+        rows = fixtures.get(table) or []
+        if not rows:
+            print("  no fixture rows - types not checked")
+            continue
+        wrong, nulled = [], set()
+        for r in rows:
+            for col, val in r.items():
+                if col not in props:
+                    continue
+                if val is None:
+                    if col in required:
+                        nulled.add(col)
+                    continue
+                why = _type_problem(props[col].get("format"), val)
+                if why:
+                    wrong.append("%s is %s, we send %s"
+                                 % (col, props[col].get("format"), why))
+        if wrong:
+            for w in sorted(set(wrong)):
+                print("  wrong type: %s" % w)
+            problems += 1
+        if nulled:
+            print("  we send null to NOT NULL columns: %s"
+                  % ", ".join(sorted(nulled)))
+            problems += 1
+        if not wrong and not nulled:
+            print("  %d fixture row(s) type-check against %d column(s)"
+                  % (len(rows), len(want)))
     print("")
     print("Schema matches." if not problems
           else "%d table(s) still mismatched." % problems)
     return 1 if problems else 0
 
 
-def _selftest():
-    """Assert every builder emits exactly the keys COLUMNS declares, so the
-    schema check can never pass while the builders write something else."""
+def _fixture_rows():
+    """Build one set of rows per table from fixtures, no network.
+
+    Two callers share this. --selftest asserts the keys match COLUMNS;
+    --check-schema pushes the same rows against the live column types. Keeping
+    them on one fixture set is deliberate: a type check fed by its own separate
+    sample would be a second source of truth about what we send, which is the
+    recurring bug in this project."""
     sd = "2026-09-01"
     ds_inf = {
         "deals": {"D1": {"id": "D1", "name": "Deal One", "amount": 900.0,
@@ -709,18 +866,40 @@ def _selftest():
                                     "industry": "Logistics",
                                     "primary_subindustry_dropdown": "Parcel"}},
     }
+    # Two SLA rows on purpose. The first is a tracked contact with a real SLA;
+    # the second is the untracked branch of build_snapshot, where every optional
+    # field arrives as "" rather than None. That branch is where a blank would
+    # reach a numeric or date column, so the type check needs to see it.
     detail = [{"contact_id": "C9", "owner_id": "77", "status": "Qualified",
                "sla": 14.0, "name": "A B", "email": "a@b.com", "company": "Acme",
                "rep": "Rep", "stage": "MQL", "entered": "(no history)", "src": "",
-               "days_status": 3.2, "days_stage": ""}]
+               "days_status": 3.2, "days_stage": ""},
+              {"contact_id": "C8", "owner_id": "", "status": "", "sla": None,
+               "name": "", "email": "", "company": "", "rep": "", "stage": "Lead",
+               "entered": "", "src": "", "days_status": "", "over": "",
+               "days_stage": 11.0}]
     owners = {"77": "Dana Rep"}
 
-    checks = [
+    return [
         ("snap_influence", rows_influence(sd, ds_inf)),
         ("snap_sourced_deal", rows_sourced_deal(sd, ds_nn, owners)),
         ("snap_sourced_contact", rows_sourced_contact(sd, ds_nn, owners)),
         ("snap_lead_sla", rows_lead_sla(sd, detail, owners)),
+        ("run_log_reports", [row_report_log("influence", sd,
+                                            "2026-09-01T06:00:00+00:00",
+                                            {"deals": 136, "value": 9603916.76},
+                                            291)]),
+        ("run_log", [row_day_log(sd, "2026-09-01T06:00:00+00:00"),
+                     row_day_log(sd, "2026-09-01T06:00:00+00:00",
+                                 "2026-09-01T06:04:00+00:00", "ok", 3, 0,
+                                 12100, "note")]),
     ]
+
+
+def _selftest():
+    """Assert every builder emits exactly the keys COLUMNS declares, so the
+    schema check can never pass while the builders write something else."""
+    checks = _fixture_rows()
     ok = True
     for table, rows in checks:
         got, want = set(rows[0]), set(COLUMNS[table])
@@ -772,7 +951,8 @@ def main():
     ap.add_argument("--sample", type=int, default=2,
                     help="rows to print per table under --dry-run (default 2)")
     ap.add_argument("--check-schema", action="store_true",
-                    help="diff our columns against the live mktg schema, then exit")
+                    help="diff our columns, conflict targets, foreign keys "
+                         "and types against the live mktg schema, then exit")
     ap.add_argument("--selftest", action="store_true",
                     help="verify builders match COLUMNS using fixtures, then exit")
     args = ap.parse_args()

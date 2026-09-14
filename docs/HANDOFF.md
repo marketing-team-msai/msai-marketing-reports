@@ -173,11 +173,35 @@ snapshots and grows about 7,200 a day. Nothing prunes.
 sync starts failing the only signal is the dashboard banner, which someone
 has to look at.
 
-**(h) `--check-schema` compares column names and nothing else.** It passed
-clean through four separate real failures across the two sessions: zero
-privileges on the schema, a conflict target matching no constraint, a wrong
-column type, and the 1000-row cap. PostgREST advertises primary keys, foreign
-keys and column formats in the same spec the check already fetches.
+**(h) `--check-schema` compares keys and types too, as of 2026-09-14.**
+It used to compare column names and nothing else, and passed clean through
+four real failures: zero privileges on the schema, a conflict target matching
+no constraint, a wrong column type, and the 1000-row cap. The first was
+already covered by the access probe. Two of the remaining three are now
+covered:
+
+- `ON_CONFLICT` against the primary key the spec advertises
+- foreign keys, including a flag if a table we write has no `run_log` parent,
+  which is the day-row ordering contract
+- NOT NULL columns we never send, and NOT NULL columns we send null to
+- column types, `format` from the spec against the values `_fixture_rows()`
+  actually builds, with date and timestamp strings parsed rather than only
+  type-tested
+
+All of it comes out of the OpenAPI spec the check was already fetching, so
+there is no extra request and no DDL. The workflow runs it before the HubSpot
+pull, so the daily run now fails fast on any of these.
+
+Verified by breaking one thing at a time - stale conflict column, missing
+conflict target, float into integer, bool into integer, `""` and
+`"(no history)"` into date, str into numeric, str into boolean, scalar into
+`text[]`, non-ISO timestamp, null into NOT NULL, dropped NOT NULL column,
+nonexistent column. 14 of 14 caught, each with a nonzero exit. That harness
+is not in the repo; it needs live credentials and there is no test runner
+here. Say the word and it can be.
+
+Still uncovered: the 1000-row cap, which is a read-path property rather than
+a schema one, and orphan rows.
 
 **(i) Every logged-in employee can read all of `mktg` directly.**
 `authenticated` holds SELECT on all tables and views and the `/auth` gate
@@ -239,9 +263,9 @@ session. Let one finish before starting the other.
 
 1. Decide (b), whether `snap_close_rate` is wanted, and (e), whether
    multi-program deals should be attributed rather than only reconciled.
-2. Extend `--check-schema` to compare keys and column types, before the
-   historical backfill is written - it will hit the same constraints from a
-   different direction.
-3. The Lead SLA page is built but was not reviewed this session. Given 34
-   Qualified contacts over 90 days, it is the page most likely to prompt
-   action.
+2. The Lead SLA page is built but has not been reviewed. Given 34 Qualified
+   contacts over 90 days, it is the page most likely to prompt action.
+3. Decide whether the `--check-schema` negative-test harness should live in
+   the repo, and what runs it.
+
+Done since: (2) extending `--check-schema`, see item (h).
