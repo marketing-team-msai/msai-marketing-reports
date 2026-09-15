@@ -121,12 +121,18 @@ functions own all aggregation.
   every input was already in `snap_sourced_deal`. `f_close_rate` replaced it
   with no ETL leg. Kept rather than dropped; that call is still open.
 - `measurement` is `not_measured` for any program listed in the
-  `unmeasured_programs` row of `config_settings`, currently Advertising.
-  That zero means "not captured", not "captured and zero", and renders as a
-  dash. `snap_ad_source` is now built (see "Ad source / Windsor" below) but
-  the row was deliberately NOT deleted yet - ad spend visibility and
-  deal-level attribution are different things, and this still-open call is
-  explained there. PR & Brand's zero is genuine and renders as $0.00.
+  `unmeasured_programs` row of `config_settings` - there was one such
+  program, Advertising, until the row was DELETED 2026-09-15 (see "Ad
+  source / Windsor" below for why). With no row present,
+  `coalesce((select array(...) from config_settings where key =
+  'unmeasured_programs'), '{}'::text[])` falls back to an empty array, so
+  every program now measures. Verified live: Advertising renders
+  `measurement = 'measured'`, `sourced_deals = 0`, `sourced_pipeline = 0`
+  for snapshot 2026-09-15 - the same genuine-zero shape PR & Brand already
+  had. If a program with no measurement path at all shows up again, the
+  fix is to re-insert this config row (see the 2026-09-02
+  `program_row_type` migration for the exact insert), not to invent a
+  second mechanism.
 - EVERY `f_*` function returns rows for EVERY `snapshot_date`, not just the
   latest. Always filter, and filter SERVER-side: `.rpc(fn, args).eq(
   "snapshot_date", d)`, or `?snapshot_date=eq.<date>` over HTTP. PostgREST
@@ -332,16 +338,16 @@ it is everywhere else. Re-count before building anything against this
 view; if it is at or near four digits, page through `metric_date` rather
 than trusting one unfiltered response.
 
-One thing this does NOT do, and nobody has decided to do yet:
-
-- `unmeasured_programs` (see the gotcha above) still lists Advertising, and
-  the config row was NOT deleted here even though CLAUDE.md previously said
-  to delete it once `snap_ad_source` was built. Ad spend and clicks now
-  exist, but `f_sourced_by_program`'s Advertising figure is still $0 for the
-  same reason as before - almost no Campaign Influence list membership ties a
-  deal to Advertising - and that has not changed. Deleting the row would make
-  that $0 render as measured, which is a different, still-open claim from
-  "we can now see ad spend." Left for a deliberate decision, not assumed.
+The `unmeasured_programs` config row for Advertising was DELETED 2026-09-15
+(a deliberate decision, made explicitly, not a side effect of building the
+ETL leg above - see the gotcha above for the mechanics). This makes
+Advertising's `f_sourced_by_program` figure render as a genuine `$0.00`
+instead of a dash. Read that as "ad spend is now visible", NOT as "deal
+attribution to Advertising now works" - those remain two different facts.
+`f_sourced_by_program`'s Advertising number is still $0 for the same
+reason as always: almost no Campaign Influence list membership ties a
+deal to Advertising. Nothing about that changed; only what the zero
+renders as changed.
 
 Paid attribution (tying spend to a deal or to sourced pipeline) still has no
 path. Nothing in the Campaign Influence lists carries it, and `snap_ad_source`
