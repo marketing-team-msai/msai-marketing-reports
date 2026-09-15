@@ -20,15 +20,26 @@
 -- live schema.
 --
 -- Captured after the 2026-09-14 migrations
--- (2026-09-14_f_close_rate.sql and
---  2026-09-14_influenced_pipeline_by_program.sql), both applied and
--- verified live the same day. New since the prior capture (2026-09-02):
--- f_influence_by_campaign / v_influence_by_campaign (staged 2026-09-02,
--- applied since, missed by the prior regeneration), f_close_rate /
--- v_close_rate, v_deal_program, f_influenced_pipeline,
--- f_influenced_by_program, f_influenced_by_combination, and
--- v_influenced_deal_detail. v_influence_headline and
--- v_sourced_contacts_by_stage remain dropped; see docs/migrations/.
+-- (2026-09-14_f_close_rate.sql,
+--  2026-09-14_influenced_pipeline_by_program.sql, and
+--  2026-09-14_events_page.sql), all applied and verified live the same
+-- day. New since the prior capture (2026-09-02): f_influence_by_campaign /
+-- v_influence_by_campaign (staged 2026-09-02, applied since, missed by the
+-- prior regeneration), f_close_rate / v_close_rate, v_deal_program,
+-- f_influenced_pipeline, f_influenced_by_program,
+-- f_influenced_by_combination, v_influenced_deal_detail, and
+-- f_event_roi / v_event_roi (the Events page - see
+-- docs/migrations/2026-09-14_events_page.sql for what it computes and
+-- why). v_influence_headline and v_sourced_contacts_by_stage remain
+-- dropped; see docs/migrations/.
+--
+-- f_event_roi / v_event_roi were hand-added here rather than pasted from
+-- a live regeneration (PostgREST cannot run this query for us) - added
+-- verbatim from the migration file that was confirmed applied clean, so
+-- this entry may drift from the true pg_get_functiondef/pg_get_viewdef
+-- output in cosmetic ways (whitespace, quoting) even though the logic
+-- matches. Re-run the regeneration query above next time someone has SQL
+-- editor access, to get the real dump back.
 -- =====================================================================
 
 -- ============================== FUNCTIONS ==============================
@@ -112,6 +123,87 @@ AS $function$
     from agg a
     cross join floor_n f
     order by a.snapshot_date, a.sort_order, a.segment_value;
+$function$
+
+-- -----------------------------------------------------------------------
+-- f_event_roi
+-- -----------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION mktg.f_event_roi()
+ RETURNS TABLE(snapshot_date date, event_id text, event_name text, event_date date, event_type text, location text, actual_attendees integer, names_captured integer, leads integer, mqls integer, sqls integer, opportunities integer, budget_cost numeric, actual_cost numeric, capture_rate numeric, qual_rate numeric, lead_mql_rate numeric, mql_sql_rate numeric, sql_opp_rate numeric, cost_per_lead numeric, cost_per_mql numeric, cost_per_sql numeric, cost_per_opportunity numeric, cost_per_sql_median numeric, cost_efficiency text, budget_variance numeric, budget_status text)
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'mktg'
+AS $function$
+    with base as (
+        select f.snapshot_date, e.event_id, e.event_name, e.event_date,
+               e.event_type, e.location, e.actual_attendees,
+               f.names_captured, f.leads, f.mqls, f.sqls, f.opportunities,
+               c.budget_cost, c.actual_cost
+        from snap_event_funnel f
+        join event e on e.event_id = f.event_id
+        left join event_cost c on c.event_id = e.event_id
+    ),
+    calc as (
+        select b.*,
+            case when b.actual_attendees > 0
+                 then b.names_captured::numeric / b.actual_attendees end
+                as capture_rate,
+            case when b.names_captured > 0
+                 then (b.leads + b.mqls + b.sqls + b.opportunities)::numeric
+                      / b.names_captured end
+                as qual_rate,
+            case when (b.leads + b.mqls + b.sqls + b.opportunities) > 0
+                 then (b.mqls + b.sqls + b.opportunities)::numeric
+                      / (b.leads + b.mqls + b.sqls + b.opportunities) end
+                as lead_mql_rate,
+            case when (b.mqls + b.sqls + b.opportunities) > 0
+                 then (b.sqls + b.opportunities)::numeric
+                      / (b.mqls + b.sqls + b.opportunities) end
+                as mql_sql_rate,
+            case when (b.sqls + b.opportunities) > 0
+                 then b.opportunities::numeric / (b.sqls + b.opportunities) end
+                as sql_opp_rate,
+            case when b.actual_cost is not null
+                      and (b.leads + b.mqls + b.sqls + b.opportunities) > 0
+                 then b.actual_cost
+                      / (b.leads + b.mqls + b.sqls + b.opportunities) end
+                as cost_per_lead,
+            case when b.actual_cost is not null
+                      and (b.mqls + b.sqls + b.opportunities) > 0
+                 then b.actual_cost / (b.mqls + b.sqls + b.opportunities) end
+                as cost_per_mql,
+            case when b.actual_cost is not null
+                      and (b.sqls + b.opportunities) > 0
+                 then b.actual_cost / (b.sqls + b.opportunities) end
+                as cost_per_sql,
+            case when b.actual_cost is not null and b.opportunities > 0
+                 then b.actual_cost / b.opportunities end
+                as cost_per_opportunity
+        from base b
+    ),
+    medians as (
+        select snapshot_date,
+               percentile_cont(0.5) within group (order by cost_per_sql)
+                   as cost_per_sql_median
+        from calc
+        group by snapshot_date
+    )
+    select c.snapshot_date, c.event_id, c.event_name, c.event_date,
+           c.event_type, c.location, c.actual_attendees, c.names_captured,
+           c.leads, c.mqls, c.sqls, c.opportunities, c.budget_cost,
+           c.actual_cost, c.capture_rate, c.qual_rate, c.lead_mql_rate,
+           c.mql_sql_rate, c.sql_opp_rate, c.cost_per_lead, c.cost_per_mql,
+           c.cost_per_sql, c.cost_per_opportunity, m.cost_per_sql_median,
+           case when c.cost_per_sql is null then null
+                when c.cost_per_sql <= m.cost_per_sql_median then 'GOOD'
+                else 'REVIEW' end as cost_efficiency,
+           case when c.budget_cost is not null and c.actual_cost is not null
+                then c.actual_cost - c.budget_cost end as budget_variance,
+           case when c.budget_cost is null or c.actual_cost is null then null
+                when c.actual_cost <= c.budget_cost then 'ON BUDGET'
+                else 'OVER BUDGET' end as budget_status
+    from calc c
+    join medians m on m.snapshot_date = c.snapshot_date;
 $function$
 
 -- -----------------------------------------------------------------------
@@ -467,6 +559,39 @@ WITH cleaned AS (
           ORDER BY k.eval_order, k.id
          LIMIT 1), 'Content & Technology'::text) AS program
    FROM cleaned c;;
+
+-- -----------------------------------------------------------------------
+-- v_event_roi
+-- -----------------------------------------------------------------------
+create or replace view mktg.v_event_roi as
+ SELECT snapshot_date,
+    event_id,
+    event_name,
+    event_date,
+    event_type,
+    location,
+    actual_attendees,
+    names_captured,
+    leads,
+    mqls,
+    sqls,
+    opportunities,
+    budget_cost,
+    actual_cost,
+    capture_rate,
+    qual_rate,
+    lead_mql_rate,
+    mql_sql_rate,
+    sql_opp_rate,
+    cost_per_lead,
+    cost_per_mql,
+    cost_per_sql,
+    cost_per_opportunity,
+    cost_per_sql_median,
+    cost_efficiency,
+    budget_variance,
+    budget_status
+   FROM mktg.f_event_roi() f_event_roi(snapshot_date, event_id, event_name, event_date, event_type, location, actual_attendees, names_captured, leads, mqls, sqls, opportunities, budget_cost, actual_cost, capture_rate, qual_rate, lead_mql_rate, mql_sql_rate, sql_opp_rate, cost_per_lead, cost_per_mql, cost_per_sql, cost_per_opportunity, cost_per_sql_median, cost_efficiency, budget_variance, budget_status);;
 
 -- -----------------------------------------------------------------------
 -- v_influence_by_campaign

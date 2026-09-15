@@ -280,8 +280,12 @@ def build_dataset():
     contacts_needed.update(multi_ids)
 
     print("[5/6] contact + company details ...", flush=True)
+    # Every deal's company, not just influenced ones: deal_company_name() and
+    # the is_amazon/is_galco checks built on it need to work for ANY deal, not
+    # only influenced ones, because sync_to_mktg.py's snap_all_deals is the
+    # portal-wide ALL-deals population (see rows_all_deals there).
     companies_needed = set()
-    for did in influenced_deal_ids:
+    for did in deals:
         companies_needed.update(d2co.get(did, []))
     # also companies for multi-touch contacts' deals
     contact_deals = defaultdict(list)  # contactId -> [dealId] (window deals associated)
@@ -382,19 +386,26 @@ def compute_multitouch(ds):
     return rows
 
 # ----------------------------------------------------------------- windsor ----
-def pull_windsor():
+def _windsor_fetch(fields):
     if not WINDSOR_KEY:
         return None
-    fields = "source,account_name,campaign,clicks,spend,impressions,conversions"
     url = ("https://connectors.windsor.ai/all?api_key=%s&fields=%s&date_preset=%s"
            % (WINDSOR_KEY, fields, WINDSOR_PRESET))
     try:
         r = requests.get(url, timeout=90)
         r.raise_for_status()
         data = r.json()
-        rows = data.get("data", data if isinstance(data, list) else [])
+        return data.get("data", data if isinstance(data, list) else [])
     except Exception as e:
         print("      windsor pull failed: %s" % str(e)[:120], flush=True)
+        return None
+
+
+def pull_windsor():
+    """Whole-window totals, one row per source. Feeds only the standalone
+    workbook's ad-source tab (generate_report.py's own build_workbook path)."""
+    rows = _windsor_fetch("source,account_name,campaign,clicks,spend,impressions,conversions")
+    if rows is None:
         return None
     agg = defaultdict(lambda: {"account": "", "clicks": 0.0, "spend": 0.0,
                                "impr": 0, "conv": 0.0})
@@ -405,6 +416,34 @@ def pull_windsor():
         a["clicks"] += float(row.get("clicks") or 0)
         a["spend"] += float(row.get("spend") or 0)
         a["impr"] += int(float(row.get("impressions") or 0))
+        a["conv"] += float(row.get("conversions") or 0)
+    return agg
+
+
+def pull_windsor_daily():
+    """One row per (metric_date, source, account), summed across campaigns.
+    Feeds mktg.snap_ad_source, whose primary key is
+    (snapshot_date, metric_date, source, account) - the day the sync ran
+    times the day the spend actually happened, not just the source.
+
+    is_paid is decided per row, from that row's own spend, rather than from a
+    fixed list of "paid sources". Windsor/GA4 report organic and paid traffic
+    under the same source name (e.g. "google" covers both Google Ads and
+    organic search), so a source-level list would misclassify whichever one
+    did not carry spend that day."""
+    rows = _windsor_fetch("date,source,account_name,campaign,clicks,spend,impressions,conversions")
+    if rows is None:
+        return None
+    agg = defaultdict(lambda: {"clicks": 0.0, "spend": 0.0, "impr": 0.0, "conv": 0.0})
+    for row in rows:
+        d = row.get("date")
+        if not d:
+            continue
+        key = (d, row.get("source") or "?", row.get("account_name") or "")
+        a = agg[key]
+        a["clicks"] += float(row.get("clicks") or 0)
+        a["spend"] += float(row.get("spend") or 0)
+        a["impr"] += float(row.get("impressions") or 0)
         a["conv"] += float(row.get("conversions") or 0)
     return agg
 

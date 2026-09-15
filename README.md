@@ -10,11 +10,15 @@ It is plain automation. There is no AI in the data path and it costs nothing
 to run. It reads data from HubSpot, builds Excel workbooks, uploads them to
 object storage, and writes a row of numbers to Postgres. That is the whole job.
 
-Windsor.ai is a second source, but only for the standalone
-`generate_report.py` run, which pulls ad spend when given a key. The daily
-sync into the `mktg` schema does not touch it: `sync_to_mktg.py` never calls
-`pull_windsor()`, the workflow passes no `WINDSOR_*`, and `snap_ad_source`
-exists with 0 rows. That ETL leg is unbuilt, not retired. See CLAUDE.md.
+Windsor.ai is a second source: ad spend, clicks, impressions and conversions
+by day, source and account. The standalone `generate_report.py` run pulls a
+whole-window total for its own workbook tab (`pull_windsor()`); the daily sync
+into the `mktg` schema pulls the same window at day grain (`ad_source` /
+`pull_windsor_daily()`) into `mktg.snap_ad_source`, one row per
+`(metric_date, source, account)`, `is_paid` decided per row from that row's
+own spend. Both need `WINDSOR_API_KEY`; without it, `ad_source` logs "not
+set" and writes nothing rather than failing the other four reports. See
+CLAUDE.md.
 
 Publishing to the Marketing SharePoint site is still supported and still in the
 code, but it is off by default, because it is the only part that needs a
@@ -115,6 +119,13 @@ You do not need to read the code, but here is what each piece is for.
 - `generate_report.py` - builds the Pipeline Influence report.
 - `generate_netnew_report.py` - builds the Net New / Sourced report.
 - `generate_sla_report.py` - builds the Lead Pipeline SLA report.
+- `generate_events_report.py` - pulls per-event funnel counts (Names/Leads/
+  MQLs/SQLs/Opportunities) for the Events page. Unlike the three above, it
+  builds no workbook and is not run by `run_all_reports.py` - its only
+  consumer is `sync_to_mktg.py`, via `mktg.snap_event_funnel`. See
+  `docs/migrations/2026-09-14_events_page.sql` for the rest of what feeds
+  that page (`mktg.event`, `mktg.event_cost`, budget vs actual, and who can
+  edit them).
 - `push_history.py` - reads the numbers the three reports just produced and
   upserts them into the Supabase history tables. Calls no external data
   source, so Supabase always matches the workbooks.

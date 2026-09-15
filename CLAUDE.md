@@ -123,8 +123,10 @@ functions own all aggregation.
 - `measurement` is `not_measured` for any program listed in the
   `unmeasured_programs` row of `config_settings`, currently Advertising.
   That zero means "not captured", not "captured and zero", and renders as a
-  dash. Delete the config row when `snap_ad_source` is built. PR & Brand's
-  zero is genuine and renders as $0.00.
+  dash. `snap_ad_source` is now built (see "Ad source / Windsor" below) but
+  the row was deliberately NOT deleted yet - ad spend visibility and
+  deal-level attribution are different things, and this still-open call is
+  explained there. PR & Brand's zero is genuine and renders as $0.00.
 - EVERY `f_*` function returns rows for EVERY `snapshot_date`, not just the
   latest. Always filter, and filter SERVER-side: `.rpc(fn, args).eq(
   "snapshot_date", d)`, or `?snapshot_date=eq.<date>` over HTTP. PostgREST
@@ -168,6 +170,32 @@ functions own all aggregation.
   Read it instead of asking for the DDL to be run by hand. It is not applied
   by anything, so it goes stale silently: refresh it whenever a migration
   lands. The regeneration query is in its header.
+- The Events page (`docs/migrations/2026-09-14_events_page.sql`) is the
+  first place in this schema where `authenticated` can WRITE anything.
+  `mktg.event` and `mktg.event_cost` are hand-maintained (name/date/
+  location/attendees, and budget vs actual cost), never touched by
+  `sync_to_mktg.py`, and writable only by emails listed in
+  `mktg.event_editor` - enforced by RLS policies calling
+  `mktg.is_event_editor()`, not by a Python check. `event_editor` itself
+  has no grants to `authenticated` at all; manage it by hand in the SQL
+  editor. An event can map to MORE THAN ONE HubSpot Campaign Influence list
+  (`mktg.event_hubspot_list`, discovered 2026-09-14 with The Reliability
+  Conference's separate Booth and Collateral lists) - a list still belongs
+  to exactly one event (`hubspot_list_id` is UNIQUE there).
+  `mktg.snap_event_funnel` is a normal snap_* table (counts only, written
+  daily by the new `generate_events_report.py` via `sync_to_mktg.py`).
+  `f_event_roi()`/`v_event_roi` join all of these and compute the funnel
+  rates, cost-per-stage (off `actual_cost`), a cost-efficiency GOOD/REVIEW
+  flag from a live cohort median (recomputed per `snapshot_date`, not a
+  fixed baseline), and a separate budget ON BUDGET/OVER BUDGET flag - the
+  two flags answer different questions and are deliberately not merged.
+  Opportunity here is a contact lifecycle stage, same rule as everywhere
+  else - no deals are joined for events, so there is no "influenced
+  pipeline $" for events yet; a plausible fast-follow, not built.
+  `percentile_cont` cannot take `OVER` (it is an ordered-set aggregate, not
+  a window function) - `f_event_roi` computes the median as a `GROUP BY`
+  aggregate in its own CTE, joined back by `snapshot_date`, not as a window
+  function over the per-event rows directly.
 
 ## Window anchor
 
@@ -242,25 +270,63 @@ sum to sourced pipeline and must not be presented as if they do.
 
 ## Ad source / Windsor
 
-Windsor is NOT decommissioned, and it is NOT wired into the mktg pipeline.
-Both halves matter:
+WIRED IN 2026-09-15. `sync_to_mktg.py`'s fifth leg, `ad_source`, now calls
+`generate_report.pull_windsor_daily()` and writes `mktg.snap_ad_source` daily.
+`pull_windsor()` (whole-window totals, one row per source) is unchanged and
+still feeds only the standalone workbook run - a separate function so that
+path could not regress.
 
-- `pull_windsor()` still exists in `generate_report.py` and is still called by
-  that script's standalone workbook run. The code path is live.
-- `sync_to_mktg.py` never calls it and never writes `snap_ad_source`. The
-  workflow's generated `config.env` carries no `WINDSOR_*`, so a scheduled run
-  has no key and pulls nothing.
-- `config.env.example` still documents `WINDSOR_API_KEY` and
-  `WINDSOR_DATE_PRESET`, and a local `config.env` may still carry the key.
-- `mktg.snap_ad_source` and `mktg.v_ad_performance` exist and hold 0 rows.
+- Grain is `(metric_date, source, account)` per snapshot_date, matching the
+  table's actual primary key (`snapshot_date, metric_date, source, account`),
+  not one row per source like the workbook path. Every run re-pulls and
+  upserts the WHOLE `WINDSOR_DATE_PRESET` trailing window (default
+  `last_365d`), which is what backfilled history on the first run rather than
+  a separate backfill process - there is no `is_seeded = true` data here, by
+  the same "this script always writes is_seeded = false" rule as everything
+  else it writes.
+- `is_paid` is decided PER ROW (`spend > 0`), not per source. Verified live
+  2026-09-15: `google` carries both paid rows (spend > 0, Google Ads) and
+  organic rows (spend = 0, organic search) under the same source name in the
+  same window, so a fixed paid-source list would misclassify one of them.
+  This is the same spend>0 rule the workbook's paid/organic split already
+  used, just applied at day grain instead of collapsed over the whole
+  window - not a new rule.
+- First live run (2026-09-15): 710 rows, `metric_date` 2025-12-02 to
+  2026-09-14, $49,590.72 total spend - $25,176.12 google, $15,443.40
+  linkedin, $8,971.20 reddit, $0 bing. Re-verify before trusting these; they
+  move with Windsor's own trailing window on every run, same as the deal
+  population moves in the population-reconciliation section above.
+- The GitHub Actions workflow now writes `WINDSOR_API_KEY` /
+  `WINDSOR_DATE_PRESET` into `config.env` from a `WINDSOR_API_KEY` repo
+  secret. If that secret is not set, `ad_source` logs "not set" and writes
+  nothing - it does not fail the run or the other four reports.
+- `config.env.example` and a local `config.env` still document/carry the same
+  key; nothing changed there beyond a comment.
 
-So the accurate status is: the ETL leg is unbuilt, not retired. Do not write
-"Windsor is no longer pulled" - it reads as decommissioned and it is not.
-README.md still describes the pipeline as HubSpot plus Windsor, which is true
-of `generate_report.py` and false of the daily sync.
+Two things this does NOT do, and nobody has decided to do yet:
 
-Paid attribution has a path, but only through the unbuilt `snap_ad_source`
-leg. Nothing in the Campaign Influence lists carries it.
+- `mktg.v_ad_performance` groups by `snapshot_date` (not `metric_date`), so
+  for any given day's snapshot it sums spend/clicks/etc across the ENTIRE
+  trailing window, not per-metric_date. That reads as "cost so far in the
+  trailing window", not a day-by-day trend - confirmed live, its per-source
+  totals for 2026-09-15 equal the whole-window sums above. `snap_ad_source`
+  itself keeps full `metric_date` granularity; nothing has decided whether
+  `v_ad_performance` should be rebuilt to expose a trend, and it was not
+  touched here since changing what it aggregates is a grain change, not the
+  mechanical fix this leg was.
+- `unmeasured_programs` (see the gotcha above) still lists Advertising, and
+  the config row was NOT deleted here even though CLAUDE.md previously said
+  to delete it once `snap_ad_source` was built. Ad spend and clicks now
+  exist, but `f_sourced_by_program`'s Advertising figure is still $0 for the
+  same reason as before - almost no Campaign Influence list membership ties a
+  deal to Advertising - and that has not changed. Deleting the row would make
+  that $0 render as measured, which is a different, still-open claim from
+  "we can now see ad spend." Left for a deliberate decision, not assumed.
+
+Paid attribution (tying spend to a deal or to sourced pipeline) still has no
+path. Nothing in the Campaign Influence lists carries it, and `snap_ad_source`
+has no deal_id - it is spend/clicks/conversions by source and account, not
+attribution.
 
 ## Open items
 

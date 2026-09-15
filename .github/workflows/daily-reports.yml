@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one report only: influence, netnew or sla. Blank = all three.'
+        description: 'Run one report only: influence, netnew, sla, events or ad_source. Blank = all five.'
         required: false
         default: ''
       dry_run:
@@ -51,6 +51,8 @@ jobs:
           CAMPAIGN_INFLUENCE_FOLDER_ID=240016304
           NET_NEW_PIPELINE_ID=813739955
           DEALS_CREATED_SINCE=2026-01-01
+          WINDSOR_API_KEY=${{ secrets.WINDSOR_API_KEY }}
+          WINDSOR_DATE_PRESET=last_365d
           SLA_DAYS_IN_PROGRESS=14
           SLA_DAYS_QUALIFIED=30
           SLA_DAYS_AWAITING_SALES_QUALIFICATION=1

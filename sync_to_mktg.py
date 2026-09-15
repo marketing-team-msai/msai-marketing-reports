@@ -21,6 +21,18 @@ never computes or stores them.
                                            one row per marketing-sourced contact
   sla        generate_sla_report.py     -> mktg.snap_lead_sla
                                            one row per contact in the SLA population
+  events     generate_events_report.py -> mktg.snap_event_funnel
+                                           one row per event in mktg.event, per day.
+                                           mktg.event / mktg.event_cost are hand-
+                                           maintained (via the app or by hand) and
+                                           are never written here.
+  ad_source  generate_report.py         -> mktg.snap_ad_source
+                                           one row per (metric_date, source, account)
+                                           from Windsor.ai, for every day in
+                                           WINDSOR_DATE_PRESET's trailing window -
+                                           not just "today". Every run rewrites the
+                                           whole window, which is what naturally
+                                           backfills history on the first run.
 
 Run bookkeeping:
 
@@ -52,7 +64,7 @@ Usage
                                             to generate_netnew_report.py, network
   python sync_to_mktg.py --dry-run --sample 5   compute, print 5 rows, write nothing
   python sync_to_mktg.py --only influence   one report
-  python sync_to_mktg.py                    all three
+  python sync_to_mktg.py                    all five
 """
 
 import argparse
@@ -69,6 +81,7 @@ from datetime import datetime, timezone
 import generate_report as influence
 import generate_netnew_report as netnew
 import generate_sla_report as sla
+import generate_events_report as events
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -140,6 +153,19 @@ COLUMNS = {
         "days_in_lifecycle_stage", "days_since_last_change", "over_sla",
         "sla_days", "is_seeded",
     ],
+    "snap_event_funnel": [
+        "snapshot_date", "event_id", "names_captured", "leads", "mqls", "sqls",
+        "opportunities", "is_seeded",
+    ],
+    "snap_ad_source": [
+        "snapshot_date", "metric_date", "source", "account", "is_paid",
+        "clicks", "impressions", "spend", "conversions", "is_seeded",
+    ],
+    "snap_all_deals": [
+        "snapshot_date", "deal_id", "deal_name", "company_name", "pipeline",
+        "stage", "close_date", "create_date", "amount_home", "is_won",
+        "is_closed", "is_influenced", "is_amazon", "is_galco", "is_seeded",
+    ],
     "run_log_reports": [
         "snapshot_date", "report", "generated_at", "status", "row_count",
         "metrics", "is_seeded",
@@ -155,6 +181,9 @@ ON_CONFLICT = {
     "snap_sourced_deal":    "snapshot_date,deal_id",
     "snap_sourced_contact": "snapshot_date,contact_id",
     "snap_lead_sla":        "snapshot_date,contact_id",
+    "snap_event_funnel":    "snapshot_date,event_id",
+    "snap_all_deals":       "snapshot_date,deal_id",
+    "snap_ad_source":       "snapshot_date,metric_date,source,account",
     "run_log_reports":      "snapshot_date,report",
     "run_log":              "snapshot_date",
 }
@@ -452,6 +481,45 @@ def rows_influence(snapshot_date, ds):
     return out
 
 
+def rows_all_deals(snapshot_date, ds):
+    """One row per deal, portal-wide, EVERY pipeline - unlike snap_influence
+    (deal x contact x campaign, influenced deals only), this has exactly one
+    row per deal whether or not marketing ever touched it. This is the
+    population the Events page's sibling feature, the Overview/Influence
+    "Marketing contribution to the 2026 revenue target" card, needs to split
+    company-wide closed-won/open revenue into marketing vs sales (see
+    mktg.f_revenue_split) - that split is impossible from snap_influence
+    alone, since a deal marketing never touched simply has no row there.
+
+    is_influenced reuses generate_report.py's own influenced_deal_ids set -
+    the exact same "any associated contact is a Campaign Influence list
+    member" rule already used for snap_influence and f_influence_headline,
+    not a new definition."""
+    out = []
+    for did, d in ds["deals"].items():
+        company = ds["deal_company_name"](did)
+        amazon = netnew.is_amazon(company) or netnew.is_amazon(d["name"])
+        galco = netnew.is_galco(company) or netnew.is_galco(d["name"])
+        out.append({
+            "snapshot_date": snapshot_date,
+            "deal_id": did,
+            "deal_name": d["name"],
+            "company_name": company,
+            "pipeline": d["pipeline"],
+            "stage": d["stage"],
+            "close_date": _date(d["close"]),
+            "create_date": _date(d["create"]),
+            "amount_home": round(d["amount_home"], 2),
+            "is_won": d["won"],
+            "is_closed": d["closed"],
+            "is_influenced": did in ds["influenced_deal_ids"],
+            "is_amazon": amazon,
+            "is_galco": galco,
+            "is_seeded": IS_SEEDED,
+        })
+    return out
+
+
 def rows_sourced_deal(snapshot_date, ds, owners):
     """One row per Net New deal in the window - the full population, each
     tagged is_single_program, so the views can filter rather than assume."""
@@ -572,6 +640,47 @@ def rows_lead_sla(snapshot_date, detail_rows, owners):
     return out
 
 
+def rows_ad_source(snapshot_date, windsor_daily):
+    """One row per (metric_date, source, account) Windsor returned for the
+    configured trailing window. is_paid is per row (spend > 0), not per
+    source - see pull_windsor_daily's docstring for why a source-level list
+    would be wrong here."""
+    out = []
+    for (metric_date, source, account), a in windsor_daily.items():
+        out.append({
+            "snapshot_date": snapshot_date,
+            "metric_date": metric_date,
+            "source": source,
+            "account": account,
+            "is_paid": a["spend"] > 0,
+            "clicks": a["clicks"],
+            "impressions": a["impr"],
+            "spend": round(a["spend"], 2),
+            "conversions": a["conv"],
+            "is_seeded": IS_SEEDED,
+        })
+    return out
+
+
+def rows_event_funnel(snapshot_date, ds):
+    """One row per event in the roster, straight off generate_events_report's
+    counts. mktg.event / mktg.event_cost are hand-maintained and never
+    written here - only this table."""
+    out = []
+    for eid, c in ds["events"].items():
+        out.append({
+            "snapshot_date": snapshot_date,
+            "event_id": eid,
+            "names_captured": c["names_captured"],
+            "leads": c["leads"],
+            "mqls": c["mqls"],
+            "sqls": c["sqls"],
+            "opportunities": c["opportunities"],
+            "is_seeded": IS_SEEDED,
+        })
+    return out
+
+
 # ------------------------------------------------------------- runners -------
 def _report_delta(name, headline, keys, dry_run):
     prior = read_prior(name) if not dry_run else None
@@ -595,6 +704,8 @@ def run_influence(snapshot_date, generated_at, dry_run=False, sample=2):
     _report_delta("influence", headline, list(headline), dry_run)
 
     n = sb_upsert("snap_influence", rows, dry_run=dry_run, sample=sample)
+    n += sb_upsert("snap_all_deals", rows_all_deals(snapshot_date, ds),
+                   dry_run=dry_run, sample=sample)
     write_report_log("influence", snapshot_date, generated_at, headline, n,
                      dry_run=dry_run)
     return headline, n
@@ -648,6 +759,60 @@ def run_sla(snapshot_date, generated_at, dry_run=False, sample=2):
                   rows_lead_sla(snapshot_date, detail, owners),
                   dry_run=dry_run, sample=sample)
     write_report_log("sla", snapshot_date, generated_at, headline, n,
+                     dry_run=dry_run)
+    return headline, n
+
+
+def run_events(snapshot_date, generated_at, dry_run=False, sample=2):
+    print("[events] pulling HubSpot ...")
+    events.init()
+    # events.fetch_event_roster() does the event x event_hubspot_list join
+    # itself (see that module) - reused here rather than duplicated so there
+    # is one place that join logic lives.
+    roster = events.fetch_event_roster()
+    if not roster:
+        print("     skip   no rows in mktg.event yet")
+        headline = {"events": 0, "names_captured": 0}
+        write_report_log("events", snapshot_date, generated_at, headline, 0,
+                         dry_run=dry_run)
+        return headline, 0
+
+    ds = events.build_dataset(roster)
+    headline = {
+        "events": len(ds["events"]),
+        "names_captured": sum(c["names_captured"] for c in ds["events"].values()),
+    }
+    _report_delta("events", headline, list(headline), dry_run)
+
+    n = sb_upsert("snap_event_funnel", rows_event_funnel(snapshot_date, ds),
+                  dry_run=dry_run, sample=sample)
+    write_report_log("events", snapshot_date, generated_at, headline, n,
+                     dry_run=dry_run)
+    return headline, n
+
+
+def run_ad_source(snapshot_date, generated_at, dry_run=False, sample=2):
+    print("[ad_source] pulling Windsor.ai ...")
+    influence.init()
+    windsor = influence.pull_windsor_daily()
+    if windsor is None:
+        # No WINDSOR_API_KEY configured. Same shape as run_events' empty-roster
+        # skip: a report that legitimately has nothing to do yet, not a failure.
+        print("     skip   WINDSOR_API_KEY not set")
+        headline = {"ad_source_rows": 0, "spend": 0.0}
+        write_report_log("ad_source", snapshot_date, generated_at, headline, 0,
+                         dry_run=dry_run)
+        return headline, 0
+
+    rows = rows_ad_source(snapshot_date, windsor)
+    headline = {
+        "ad_source_rows": len(rows),
+        "spend": round(sum(r["spend"] for r in rows), 2),
+    }
+    _report_delta("ad_source", headline, list(headline), dry_run)
+
+    n = sb_upsert("snap_ad_source", rows, dry_run=dry_run, sample=sample)
+    write_report_log("ad_source", snapshot_date, generated_at, headline, n,
                      dry_run=dry_run)
     return headline, n
 
@@ -954,6 +1119,7 @@ def _fixture_rows():
                               "C2": {"Campaign Influence - Webinar",
                                      "Campaign Influence - Events"}},
         "pair_rows": [("D1", "C1"), ("D1", "C2")],
+        "influenced_deal_ids": {"D1"},
         "lists": [{"name": "Campaign Influence - Webinar", "listId": 11},
                   {"name": "Campaign Influence - Events", "listId": 22}],
         "deal_company_name": lambda d: "Acme Co",
@@ -990,11 +1156,31 @@ def _fixture_rows():
                "days_stage": 11.0}]
     owners = {"77": "Dana Rep"}
 
+    ds_events = {
+        "roster": {"E1": {"event_id": "E1", "event_name": "Sample Show",
+                          "hubspot_list_id": "99"}},
+        "events": {"E1": {"names_captured": 40, "leads": 10, "mqls": 5,
+                          "sqls": 3, "opportunities": 1}},
+    }
+
+    # One paid row (spend > 0) and one organic row (spend == 0) for the same
+    # source, on different days - the exact shape is_paid has to tell apart
+    # since it is decided per row, not per source.
+    windsor_daily = {
+        ("2026-08-30", "google", "GA4_MultiSensorAI"):
+            {"clicks": 120.0, "spend": 45.50, "impr": 4000.0, "conv": 3.0},
+        ("2026-08-31", "google", "GA4_MultiSensorAI"):
+            {"clicks": 8.0, "spend": 0.0, "impr": 300.0, "conv": 0.0},
+    }
+
     return [
         ("snap_influence", rows_influence(sd, ds_inf)),
+        ("snap_all_deals", rows_all_deals(sd, ds_inf)),
         ("snap_sourced_deal", rows_sourced_deal(sd, ds_nn, owners)),
         ("snap_sourced_contact", rows_sourced_contact(sd, ds_nn, owners)),
         ("snap_lead_sla", rows_lead_sla(sd, detail, owners)),
+        ("snap_event_funnel", rows_event_funnel(sd, ds_events)),
+        ("snap_ad_source", rows_ad_source(sd, windsor_daily)),
         ("run_log_reports", [row_report_log("influence", sd,
                                             "2026-09-01T06:00:00+00:00",
                                             {"deals": 136, "value": 9603916.76},
@@ -1010,6 +1196,7 @@ def _selftest():
     """Assert every builder emits exactly the keys COLUMNS declares, so the
     schema check can never pass while the builders write something else."""
     checks = _fixture_rows()
+    by_table = dict(checks)
     ok = True
     for table, rows in checks:
         got, want = set(rows[0]), set(COLUMNS[table])
@@ -1020,7 +1207,7 @@ def _selftest():
         else:
             print("ok   %-22s %d row(s), %d columns" % (table, len(rows), len(got)))
 
-    inf = checks[0][1]
+    inf = by_table["snap_influence"]
     print("")
     print("influence grain: %d rows from 1 deal, 2 contacts, union of 2 campaigns"
           % len(inf))
@@ -1033,7 +1220,7 @@ def _selftest():
         print("    %s x %s x %-35s %s"
               % (r["deal_id"], r["contact_id"], r["campaign_name"],
                  r["even_split_value"]))
-    c = checks[2][1][0]
+    c = by_table["snap_sourced_contact"][0]
     print("")
     print("contact vertical/sub_vertical: %r / %r ; is_internal=%r"
           % (c["vertical"], c["sub_vertical"], c["is_internal"]))
@@ -1041,12 +1228,23 @@ def _selftest():
           % sorted({(r["contact_id"], r["is_internal"]) for r in inf}))
     print("influence is_storefront: %s" % sorted({r["is_storefront"] for r in inf}))
 
-    s = checks[3][1][0]
+    ad = by_table["snap_all_deals"][0]
+    print("")
+    print("all-deals grain: %d row(s) (1 per deal, portal-wide) ; is_influenced=%r for D1 "
+          "(has influenced contacts in ds_inf)" % (len(by_table["snap_all_deals"]), ad["is_influenced"]))
+
+    s = by_table["snap_lead_sla"][0]
     print("")
     print("sla null handling: entered_status_date=%r days_in_lifecycle_stage=%r "
           "days_since_last_change=%r owner_name=%r"
           % (s["entered_status_date"], s["days_in_lifecycle_stage"],
              s["days_since_last_change"], s["owner_name"]))
+
+    ads = by_table["snap_ad_source"]
+    print("")
+    print("ad_source grain: %d row(s), is_paid per row (same source, "
+          "different days): %s"
+          % (len(ads), sorted((r["metric_date"], r["is_paid"]) for r in ads)))
     return 0 if ok else 1
 
 
@@ -1054,8 +1252,9 @@ def _selftest():
 def main():
     ap = argparse.ArgumentParser(
         description="Sync report detail into the mktg schema.")
-    ap.add_argument("--only", choices=["influence", "netnew", "sla"],
-                    help="run one report instead of all three")
+    ap.add_argument("--only",
+                    choices=["influence", "netnew", "sla", "events", "ad_source"],
+                    help="run one report instead of all five")
     ap.add_argument("--dry-run", action="store_true",
                     help="compute and print payloads, write nothing")
     ap.add_argument("--sample", type=int, default=2,
@@ -1093,7 +1292,8 @@ def main():
     started = datetime.now(timezone.utc)
     snapshot_date, gen_at = started.strftime("%Y-%m-%d"), started.isoformat()
 
-    jobs = [("influence", run_influence), ("netnew", run_netnew), ("sla", run_sla)]
+    jobs = [("influence", run_influence), ("netnew", run_netnew), ("sla", run_sla),
+            ("events", run_events), ("ad_source", run_ad_source)]
     if args.only:
         jobs = [j for j in jobs if j[0] == args.only]
 
