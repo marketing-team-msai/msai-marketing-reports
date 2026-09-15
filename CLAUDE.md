@@ -303,17 +303,37 @@ path could not regress.
 - `config.env.example` and a local `config.env` still document/carry the same
   key; nothing changed there beyond a comment.
 
-Two things this does NOT do, and nobody has decided to do yet:
+`v_ad_performance` NOW GROUPS BY `metric_date` TOO, fixed and verified live
+2026-09-15 (`docs/migrations/2026-09-15_v_ad_performance_metric_date.sql`).
+Before this it grouped by `snapshot_date` only, so any given day's snapshot
+summed spend/clicks/etc across the ENTIRE trailing window rather than per
+day - it read as "cost so far in the trailing window", not a trend, even
+though `snap_ad_source` itself always held full daily grain. Confirmed
+live: `snapshot_date = 2026-09-15` now returns 710 rows spanning 255
+distinct `metric_date` values (2025-12-02 to 2026-09-14), and the single
+newest day (`metric_date = 2026-09-14`) returns exactly one row (google /
+MultiSensor AI & ICI, $58.19) instead of the whole window. The migration
+had to `DROP` and recreate the view rather than `CREATE OR REPLACE`,
+because Postgres only allows new columns appended at the end of an
+existing view's column list, not inserted in the middle - so the grant to
+`authenticated` is re-issued inside the same migration, same trap as the
+function-signature case above.
 
-- `mktg.v_ad_performance` groups by `snapshot_date` (not `metric_date`), so
-  for any given day's snapshot it sums spend/clicks/etc across the ENTIRE
-  trailing window, not per-metric_date. That reads as "cost so far in the
-  trailing window", not a day-by-day trend - confirmed live, its per-source
-  totals for 2026-09-15 equal the whole-window sums above. `snap_ad_source`
-  itself keeps full `metric_date` granularity; nothing has decided whether
-  `v_ad_performance` should be rebuilt to expose a trend, and it was not
-  touched here since changing what it aggregates is a grain change, not the
-  mechanical fix this leg was.
+THIS VIEW CAN NOW APPROACH POSTGREST'S 1000-ROW CAP ON A SINGLE
+`snapshot_date`, unlike every other `f_*`/`v_*` object in this schema.
+Because every daily sync rewrites the WHOLE trailing window under that
+day's snapshot_date, one snapshot_date alone already carries 710 rows
+today. At the current pace (~2.8 rows per calendar day) a full `last_365d`
+window projects to roughly 1,015 rows for a single snapshot_date - over
+the cap, with no second filter dimension available the way `row_type` or
+`segment_type` give the other functions one. Filtering server-side on
+`snapshot_date` is necessary here but is NOT guaranteed sufficient the way
+it is everywhere else. Re-count before building anything against this
+view; if it is at or near four digits, page through `metric_date` rather
+than trusting one unfiltered response.
+
+One thing this does NOT do, and nobody has decided to do yet:
+
 - `unmeasured_programs` (see the gotcha above) still lists Advertising, and
   the config row was NOT deleted here even though CLAUDE.md previously said
   to delete it once `snap_ad_source` was built. Ad spend and clicks now

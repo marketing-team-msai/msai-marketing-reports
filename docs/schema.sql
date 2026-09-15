@@ -40,6 +40,11 @@
 -- output in cosmetic ways (whitespace, quoting) even though the logic
 -- matches. Re-run the regeneration query above next time someone has SQL
 -- editor access, to get the real dump back.
+--
+-- v_ad_performance was rebuilt 2026-09-15 (docs/migrations/2026-09-15_v_ad_
+-- performance_metric_date.sql, applied and verified live the same day) to
+-- group by metric_date instead of collapsing the whole trailing window per
+-- snapshot_date. Same hand-added caveat as f_event_roi above.
 -- =====================================================================
 
 -- ============================== FUNCTIONS ==============================
@@ -511,8 +516,16 @@ $function$
 -- -----------------------------------------------------------------------
 -- v_ad_performance
 -- -----------------------------------------------------------------------
+-- Hand-added rather than pasted from a live regeneration (PostgREST cannot
+-- run pg_get_viewdef for us - see this file's header). Verbatim from
+-- docs/migrations/2026-09-15_v_ad_performance_metric_date.sql, confirmed
+-- applied live 2026-09-15 (PASTE 2.4: 710 rows, 255 distinct metric_dates
+-- for snapshot_date 2026-09-15, matching the migration's predicted
+-- values), so may drift from pg_get_viewdef's exact whitespace/quoting
+-- even though the logic matches - same caveat as f_event_roi below.
 create or replace view mktg.v_ad_performance as
 SELECT snapshot_date,
+    metric_date,
     is_paid,
     source,
     account,
@@ -521,7 +534,7 @@ SELECT snapshot_date,
     sum(spend) AS spend,
     sum(conversions) AS conversions
    FROM mktg.snap_ad_source
-  GROUP BY snapshot_date, is_paid, source, account;;
+  GROUP BY snapshot_date, metric_date, is_paid, source, account;
 
 -- -----------------------------------------------------------------------
 -- v_close_rate
