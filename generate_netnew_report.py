@@ -14,7 +14,7 @@ Two grains (both from Alecia's own definitions in her SharePoint docs):
      SINGLE-PROGRAM INFLUENCED. A deal is single-program influenced by a
      program when EVERY marketing campaign that touched any of its associated
      contacts maps to exactly ONE program bucket
-     (Content & Technology / Events / Advertising / PR & Brand).
+     (Content & Technology / Events / Advertising / PR & Brand / Webinars).
      This identifies single-program INFLUENCE, not opportunity origin: the
      rule says nothing about which touch came first or caused the deal. It
      was previously labelled "sourced / marketing-originated proxy", which
@@ -167,11 +167,23 @@ def since_ms():
     return str(int(dt.timestamp() * 1000))
 
 # ---------------------------------------------------- program classifier ------
-# Maps a Campaign Influence list/campaign NAME to one of the four offsite
-# program buckets. Keyword rules, reverse-engineered from Alecia's list set and
-# slide 15. Advertising tested first (paid overrides), then Events, then PR,
-# else Content & Technology (the workhorse catch-all: content, webinar,
+# Maps a Campaign Influence list/campaign NAME to one of the program buckets.
+# Keyword rules, reverse-engineered from Alecia's list set and slide 15.
+# Advertising tested first (paid overrides), then Events, then PR, then
+# Webinars, else Content & Technology (the workhorse catch-all: content,
 # whitepaper, video, blog, fact sheet, pillar page, forms, case studies).
+#
+# Webinars was split out of the Content & Technology catch-all 2026-09-15
+# (see CLAUDE.md "Webinars program"). Only NEW snapshot rows in
+# snap_sourced_deal pick this up, because that table's program/
+# is_single_program columns are computed here in Python and frozen at ETL
+# write time - already-written snapshot_dates keep their old classification
+# until a future run rewrites them. v_deal_program (the influenced-pipeline
+# path) reclassifies from config_program_keywords at QUERY time instead, so
+# f_influenced_by_program / f_influenced_pipeline move for every historical
+# snapshot_date the moment config_program_keywords picks up "webinar" - a
+# deliberate two-speed effect, not a bug. See docs/migrations/
+# 2026-09-15_add_webinars_program.sql.
 #
 # THE SINGLE SOURCE. mktg.config_program_keywords in Postgres used to be a
 # hand-maintained mirror of this - two copies of the same rule, verified
@@ -198,6 +210,8 @@ PROGRAM_KEYWORDS = (
       "data center world", "mainstream", "attendees")),
     ("PR & Brand", 3,
      ("pr:", "press", "investor", "g2 crowd", "earned media", "media banner")),
+    ("Webinars", 4,
+     ("webinar",)),
 )
 
 def classify_program(name):
@@ -460,7 +474,12 @@ def compute_slide15_grain(ds):
     function for that purpose understates sourced pipeline - it hid $4.39M
     across 10 deals when the mktg sync briefly relied on it.
 
-    Kept only so the workbook can still reproduce the historical slide."""
+    Kept only so the workbook can still reproduce the historical slide, whose
+    four buckets predate the 2026-09-15 Webinars split - classify_program()
+    can now return a program not in PROGRAMS, so any such deal is folded
+    into Content & Technology here, matching where it would have landed
+    before that split and keeping this frozen historical comparison from
+    silently dropping dollars or KeyError'ing."""
     deals = ds["deals"]
     prog = {p: {"deals": 0, "sourced": 0.0, "won": 0.0, "won_deals": 0} for p in PROGRAMS}
     galco = {"deals": 0, "sourced": 0.0, "won": 0.0}
@@ -478,7 +497,7 @@ def compute_slide15_grain(ds):
                 galco["won"] += d["amount"]
             continue
         if d["single_program"]:
-            p = d["program"]
+            p = d["program"] if d["program"] in prog else "Content & Technology"
             prog[p]["deals"] += 1
             prog[p]["sourced"] += d["amount"]
             if d["won"]:

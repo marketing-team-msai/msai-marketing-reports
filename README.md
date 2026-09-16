@@ -51,7 +51,7 @@ figure.
 Shows new pipeline that marketing created or influenced, at two levels. The
 deal level treats a deal as "sourced" by a program when every marketing
 campaign that touched it maps to a single program bucket (Content &
-Technology, Events, Advertising, or PR & Brand). The contact level counts
+Technology, Events, Advertising, PR & Brand, or Webinars). The contact level counts
 contacts created since the start date that belong to at least one Campaign
 Influence list, arranged by lifecycle stage. Scope excludes Amazon and
 isolates Galco, per the marketing team's definitions.

@@ -62,6 +62,8 @@ Usage
                                             foreign keys and types vs live
   python sync_to_mktg.py --sync-keywords    reconcile config_program_keywords
                                             to generate_netnew_report.py, network
+  python sync_to_mktg.py --sync-campaign-types  reconcile config_campaign_type_program
+                                            to generate_report.py, network
   python sync_to_mktg.py --dry-run --sample 5   compute, print 5 rows, write nothing
   python sync_to_mktg.py --only influence   one report
   python sync_to_mktg.py                    all five
@@ -459,7 +461,8 @@ def rows_influence(snapshot_date, ds):
                     "contact_email": email,
                     "campaign_id": camp_ids.get(camp),
                     "campaign_name": camp,
-                    "campaign_type": influence.classify_campaign(camp),
+                    "campaign_type": ds["campaign_type_by_name"].get(camp)
+                                     or influence.classify_campaign(camp),
                     "even_split_value": share,
                     "amount_home": round(d["amount_home"], 2),
                     "deal_name": d["name"],
@@ -897,6 +900,63 @@ def sync_program_keywords(dry_run=False):
     return changes
 
 
+# ----------------------------------------------- campaign type -> program ----
+def campaign_type_program_rows():
+    """Canonical (campaign_type, program) rows, read straight from
+    influence.CAMPAIGN_TYPE_PROGRAM - the single place this mapping is
+    defined now, same pattern as program_keyword_rows() above. Every
+    campaign_type maps to exactly one program by construction (it's a
+    dict), so there is no analogous "listed under two programs" failure
+    mode to guard here."""
+    return [{"campaign_type": t, "program": p}
+            for t, p in influence.CAMPAIGN_TYPE_PROGRAM.items()]
+
+
+def sync_campaign_type_program(dry_run=False):
+    """Reconcile mktg.config_campaign_type_program to exactly match
+    influence.CAMPAIGN_TYPE_PROGRAM: add missing types, remove retired
+    ones, patch any whose program changed. Idempotent, same reconcile-by-
+    natural-key approach as sync_program_keywords()."""
+    canonical = {r["campaign_type"]: r for r in campaign_type_program_rows()}
+    current = {r["campaign_type"]: r for r in
+              sb_select("config_campaign_type_program",
+                       "select=id,campaign_type,program")}
+
+    to_add = [canonical[k] for k in canonical if k not in current]
+    to_remove = [current[k] for k in current if k not in canonical]
+    to_update = [(current[k]["id"], canonical[k]) for k in canonical
+                if k in current and current[k]["program"] != canonical[k]["program"]]
+
+    print("config_campaign_type_program: %d live, %d canonical"
+          % (len(current), len(canonical)))
+    for r in to_add:
+        print("     add    %-30s -> %s" % (r["campaign_type"], r["program"]))
+    for r in to_remove:
+        print("     remove %-30s -> %s" % (r["campaign_type"], r["program"]))
+    for _id, r in to_update:
+        old = current[r["campaign_type"]]
+        print("     update %-30s %s -> %s"
+              % (r["campaign_type"], old["program"], r["program"]))
+
+    changes = len(to_add) + len(to_remove) + len(to_update)
+    if not changes:
+        print("     ok     already in sync")
+        return 0
+    if dry_run:
+        print("     dry    %d change(s), nothing written" % changes)
+        return changes
+
+    if to_add:
+        sb_upsert("config_campaign_type_program", to_add)
+    for _id, r in to_update:
+        sb_patch("config_campaign_type_program", "id=eq.%s" % _id,
+                {"program": r["program"]})
+    for r in to_remove:
+        sb_delete("config_campaign_type_program", "id=eq.%s" % r["id"])
+    print("     ok     %d change(s) applied" % changes)
+    return changes
+
+
 # -------------------------------------------------------- schema check -------
 # PostgREST advertises the Postgres type of every column as `format`, and marks
 # primary and foreign keys inside `description`. These are the Python types a
@@ -1122,6 +1182,8 @@ def _fixture_rows():
         "influenced_deal_ids": {"D1"},
         "lists": [{"name": "Campaign Influence - Webinar", "listId": 11},
                   {"name": "Campaign Influence - Events", "listId": 22}],
+        "campaign_type_by_name": {"Campaign Influence - Webinar": "Webinar - Own",
+                                  "Campaign Influence - Events": "External Event"},
         "deal_company_name": lambda d: "Acme Co",
         "cemail": lambda c: {"C1": "buyer@acme.com",
                              "C2": "alecia@multisensorai.com"}.get(c, ""),
@@ -1267,6 +1329,9 @@ def main():
     ap.add_argument("--sync-keywords", action="store_true",
                     help="reconcile mktg.config_program_keywords to match "
                          "generate_netnew_report.PROGRAM_KEYWORDS, then exit")
+    ap.add_argument("--sync-campaign-types", action="store_true",
+                    help="reconcile mktg.config_campaign_type_program to match "
+                         "generate_report.CAMPAIGN_TYPE_PROGRAM, then exit")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1280,6 +1345,14 @@ def main():
         else:
             print("DRY RUN - computing the keyword diff, writing nothing")
         sync_program_keywords(dry_run=args.dry_run)
+        sys.exit(0)
+    if args.sync_campaign_types:
+        init_creds()
+        if not args.dry_run:
+            _require_creds()
+        else:
+            print("DRY RUN - computing the campaign_type diff, writing nothing")
+        sync_campaign_type_program(dry_run=args.dry_run)
         sys.exit(0)
 
     init_creds()

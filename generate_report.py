@@ -114,7 +114,16 @@ def since_ms():
     return str(int(dt.timestamp() * 1000))
 
 # ------------------------------------------------------- campaign classifier --
-# Reverse-engineered from Alecia's July 9 workbook (name-keyword rules).
+# FALLBACK ONLY as of 2026-09-15. Every Campaign Influence list's filter
+# links to exactly one native HubSpot Campaign via
+# hs_marketing_campaign_object_id (verified live against list 4463 - see
+# CLAUDE.md "Real campaign_type"), and that Campaign's own campaign_type
+# custom property is the real, backfilled, marketing-ops-maintained answer.
+# build_dataset() prefers that real value; this name-keyword guess only
+# fires for the handful of lists with no such link - the paid-ad lists
+# (LinkedIn/Google/Meta) built on ad-platform filters instead of a Campaign
+# reference, plus any similarly orphaned list. Reverse-engineered from
+# Alecia's July 9 workbook.
 def classify_campaign(name):
     n = name.lower()
     if "pr:" in n:                                    return "PR"
@@ -128,6 +137,59 @@ def classify_campaign(name):
     if ("web form" in n) or ("request a quote" in n) or ("solution brief" in n):
         return "Form"
     return "Content"
+
+# Every campaign_type value seen or declared as of 2026-09-15 (the 24 real
+# HubSpot picklist values, plus classify_campaign()'s own fallback
+# vocabulary), grouped into the broader named buckets used for INFLUENCE
+# reporting (mktg.v_deal_program, f_influenced_by_program,
+# v_deal_touch_summary). THE SINGLE SOURCE for
+# mktg.config_campaign_type_program - sync_to_mktg.py --sync-campaign-types
+# reconciles that table to this dict exactly, same pattern as
+# PROGRAM_KEYWORDS / config_program_keywords in generate_netnew_report.py.
+# Edit groupings ONLY here.
+#
+# Deliberately separate from generate_netnew_report.PROGRAM_KEYWORDS: that
+# one governs the Net New / "sourced" side (is_single_program, keyed off a
+# keyword guess on campaign_name) and is UNCHANGED by this - sourced
+# pipeline is pending its own future rework based on contact Lead Source,
+# not campaign influence. This dict only feeds the influence side, which
+# has no exclusivity rule: a deal can and does carry more than one program.
+CAMPAIGN_TYPE_PROGRAM = {
+    # Real HubSpot campaign_type values (native Campaign object property).
+    "Web Content":                  "Content",
+    "Web Content - ICI":            "Content",
+    "Collateral":                   "Content",
+    "Case Study":                   "Content",
+    "Whitepaper":                   "Content",
+    "Research Paper":               "Content",
+    "Survey":                       "Content",
+    "Video":                        "Content",
+    "Webinar":                      "Webinars",
+    "Webinar - Own":                "Webinars",
+    "External Event":               "Events",
+    "Event - Internal":             "Events",
+    "PR":                           "PR & Media",
+    "External Contributed Article": "PR & Media",
+    "Paid Search":                  "Advertising",
+    "Web Ads - External":           "Advertising",
+    "Web Ads - Own":                "Advertising",
+    "Paid Social":                  "Advertising",
+    "Website Form":                 "Web Forms",
+    "Website Form - ICI":           "Web Forms",
+    "Organic Social":               "Organic Social",
+    "Product Launch":               "Product Launch",
+    "Outsourced SDR":               "Outsourced SDR",
+    "Email - Database":             "Email",
+    "Email - Bespoke":              "Email",
+    # classify_campaign()'s fallback vocabulary, for lists with no linked
+    # native Campaign. "PR"/"Case Study"/"Webinar"/"Whitepaper"/"Video"
+    # already appear above with the same spelling; only the remaining
+    # fallback-only outputs need an entry.
+    "Blog":                         "Content",
+    "Event":                        "Events",
+    "Form":                         "Web Forms",
+    "Content":                      "Content",
+}
 
 # ------------------------------------------------------------- data pull ------
 def pull_pipelines():
@@ -145,6 +207,51 @@ def pull_campaign_lists():
     lists = [l for l in res.get("lists", [])
              if l["name"].lower().startswith("campaign influence")]
     return lists
+
+def pull_native_campaigns():
+    """Every native HubSpot Marketing Campaign, hs_object_id -> campaign_type.
+    Needs the marketing.campaigns.read scope on HUBSPOT_TOKEN (added
+    2026-09-15 - see CLAUDE.md "Real campaign_type"). 115 campaigns as of
+    that date; paginates regardless."""
+    out = {}
+    after = None
+    while True:
+        params = {"limit": 100, "properties": "campaign_type,hs_object_id"}
+        if after:
+            params["after"] = after
+        r = hs_get("/marketing/v3/campaigns", params)
+        for c in r.get("results", []):
+            oid = c["properties"].get("hs_object_id")
+            if oid:
+                out[oid] = c["properties"].get("campaign_type")
+        after = (r.get("paging", {}) or {}).get("next", {}).get("after")
+        if not after:
+            break
+    return out
+
+def list_linked_campaign_type(list_id, camp_type_by_objid):
+    """A Campaign Influence list's filter branch references exactly one
+    native Campaign via a hs_marketing_campaign_object_id filter, whose
+    value's LAST '-'-separated segment is that Campaign's hs_object_id
+    (verified live 2026-09-15 against list 4463: "MSAI 2026 Blog Content").
+    Returns None for the paid-ad lists built on ad-platform filters
+    instead (8 found 2026-09-15: LinkedIn/Google/Meta), and for any
+    similarly orphaned list - callers fall back to classify_campaign()."""
+    detail = hs_get("/crm/v3/lists/%s" % list_id, {"includeFilters": "true"})
+    fb = detail.get("list", {}).get("filterBranch", {})
+    found_oid = [None]
+    def walk(node):
+        for f in node.get("filters", []):
+            if f.get("property") == "hs_marketing_campaign_object_id":
+                vals = f.get("operation", {}).get("values", [])
+                if vals:
+                    found_oid[0] = vals[0].split("-")[-1]
+        for child in node.get("filterBranches", []):
+            walk(child)
+    walk(fb)
+    if not found_oid[0]:
+        return None
+    return camp_type_by_objid.get(found_oid[0])
 
 def pull_memberships(list_id):
     ids, after = [], None
@@ -215,6 +322,19 @@ def build_dataset():
     print("[2/6] campaign influence lists ...", flush=True)
     lists = pull_campaign_lists()
     print("      %d campaign lists" % len(lists), flush=True)
+
+    print("[2b/6] resolving real campaign_type from HubSpot Campaigns ...", flush=True)
+    camp_type_by_objid = pull_native_campaigns()
+    campaign_type_by_name = {}
+    resolved = 0
+    for l in lists:
+        ctype = list_linked_campaign_type(l["listId"], camp_type_by_objid)
+        if ctype:
+            resolved += 1
+        campaign_type_by_name[l["name"]] = ctype or classify_campaign(l["name"])
+        time.sleep(0.05)
+    print("      %d/%d lists resolved to a real campaign_type (rest fall back "
+          "to the name-keyword guess)" % (resolved, len(lists)), flush=True)
 
     contact_campaigns = defaultdict(set)   # contactId -> {campaign name}
     campaign_size = {}                      # campaign name -> membership count
@@ -315,6 +435,7 @@ def build_dataset():
 
     return dict(
         pipe_label=pipe_label, stage_label=stage_label, lists=lists,
+        campaign_type_by_name=campaign_type_by_name,
         contact_campaigns=contact_campaigns, campaign_size=campaign_size,
         total_contacts_mapped=total_contacts_mapped,
         deals=deals, total_deals=total_deals, total_value=total_value,

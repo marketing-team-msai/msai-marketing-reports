@@ -78,6 +78,16 @@ jobs:
         continue-on-error: true
         run: python sync_to_mktg.py --sync-keywords
 
+      # Same drift-prevention pattern, for the INFLUENCE side's campaign_type
+      # -> program mapping: reconciles mktg.config_campaign_type_program to
+      # generate_report.CAMPAIGN_TYPE_PROGRAM, the single source for it.
+      # v_deal_program reads that table (not campaign_name keyword-matching)
+      # as of 2026-09-15 - see CLAUDE.md "Real campaign_type". Unrelated to
+      # the sync above, which still governs the separate sourced-pipeline side.
+      - name: Sync campaign types
+        continue-on-error: true
+        run: python sync_to_mktg.py --sync-campaign-types
+
       - name: Sync to mktg
         run: |
           ARGS=""

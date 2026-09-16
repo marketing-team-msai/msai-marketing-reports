@@ -312,6 +312,14 @@ $function$
 -- -----------------------------------------------------------------------
 -- f_influenced_by_program
 -- -----------------------------------------------------------------------
+-- Hand-updated rather than pasted from a live pg_get_functiondef
+-- regeneration (this session only has PostgREST read access, not
+-- arbitrary SQL execution). Verbatim from docs/migrations/
+-- 2026-09-15_influence_program_from_campaign_type.sql, confirmed applied
+-- live 2026-09-16 (PASTE 2.2 returned 10 program rows with real figures)
+-- - same caveat as v_ad_performance above: may drift from
+-- pg_get_functiondef's exact whitespace/quoting even though the logic
+-- matches.
 CREATE OR REPLACE FUNCTION mktg.f_influenced_by_program(include_amazon boolean DEFAULT true)
  RETURNS TABLE(snapshot_date date, program text, measurement text, deals bigint, pipeline numeric)
  LANGUAGE sql
@@ -322,10 +330,16 @@ AS $function$
         select distinct snapshot_date from snap_sourced_deal
     ),
     programs (program, sort_order) as (
-        values ('Content & Technology', 1),
-               ('Events',               2),
-               ('Advertising',          3),
-               ('PR & Brand',           4)
+        values ('Content',         1),
+               ('Webinars',        2),
+               ('Product Launch',  3),
+               ('Events',          4),
+               ('Web Forms',       5),
+               ('PR & Media',      6),
+               ('Email',           7),
+               ('Organic Social',  8),
+               ('Advertising',     9),
+               ('Outsourced SDR', 10)
     ),
     unmeasured as (
         select coalesce(
@@ -556,22 +570,40 @@ SELECT snapshot_date,
 -- -----------------------------------------------------------------------
 -- v_deal_program
 -- -----------------------------------------------------------------------
+-- Hand-updated (see f_influenced_by_program note above for why). Verbatim
+-- from docs/migrations/2026-09-15_influence_program_from_campaign_type.sql,
+-- confirmed applied live 2026-09-16.
 create or replace view mktg.v_deal_program as
-WITH cleaned AS (
-         SELECT i.snapshot_date,
-            i.deal_id,
-            btrim(replace(replace(lower(i.campaign_name), 'campaign influence:'::text, ''::text), 'campaign influence :'::text, ''::text)) AS cname
-           FROM mktg.snap_influence i
-             JOIN mktg.snap_sourced_deal d ON d.snapshot_date = i.snapshot_date AND d.deal_id = i.deal_id
-        )
- SELECT DISTINCT snapshot_date,
-    deal_id,
-    COALESCE(( SELECT k.program
-           FROM mktg.config_program_keywords k
-          WHERE POSITION((k.keyword) IN (c.cname)) > 0
-          ORDER BY k.eval_order, k.id
-         LIMIT 1), 'Content & Technology'::text) AS program
-   FROM cleaned c;;
+select distinct
+    i.snapshot_date,
+    i.deal_id,
+    coalesce(p.program, 'Content') as program
+from mktg.snap_influence i
+join mktg.snap_sourced_deal d
+  on d.snapshot_date = i.snapshot_date and d.deal_id = i.deal_id
+left join mktg.config_campaign_type_program p
+       on p.campaign_type = i.campaign_type;;
+
+-- -----------------------------------------------------------------------
+-- v_deal_touch_summary
+-- -----------------------------------------------------------------------
+-- New 2026-09-16 (see docs/migrations/
+-- 2026-09-15_influence_program_from_campaign_type.sql). Hand-added, same
+-- caveat as the other entries in this file today.
+create or replace view mktg.v_deal_touch_summary as
+select
+    i.snapshot_date,
+    i.deal_id,
+    count(distinct i.campaign_name) as campaign_count,
+    count(distinct coalesce(p.program, 'Content')) as program_count,
+    array_agg(distinct coalesce(p.program, 'Content')
+              order by coalesce(p.program, 'Content')) as programs
+from mktg.snap_influence i
+join mktg.snap_sourced_deal d
+  on d.snapshot_date = i.snapshot_date and d.deal_id = i.deal_id
+left join mktg.config_campaign_type_program p
+       on p.campaign_type = i.campaign_type
+group by i.snapshot_date, i.deal_id;;
 
 -- -----------------------------------------------------------------------
 -- v_event_roi
@@ -622,16 +654,20 @@ SELECT snapshot_date,
 -- -----------------------------------------------------------------------
 -- v_influenced_deal_detail
 -- -----------------------------------------------------------------------
+-- Hand-updated (see f_influenced_by_program note above for why). Verbatim
+-- from docs/migrations/2026-09-15_influence_program_from_campaign_type.sql,
+-- confirmed applied live 2026-09-16.
 create or replace view mktg.v_influenced_deal_detail as
-WITH combos AS (
-         SELECT v_deal_program.snapshot_date,
-            v_deal_program.deal_id,
-            string_agg(v_deal_program.program, ' + '::text ORDER BY v_deal_program.program) AS combination,
-            count(*)::integer AS program_count
-           FROM mktg.v_deal_program
-          GROUP BY v_deal_program.snapshot_date, v_deal_program.deal_id
-        )
- SELECT i.snapshot_date,
+with combos as (
+    select v_deal_program.snapshot_date,
+           v_deal_program.deal_id,
+           string_agg(v_deal_program.program, ' + ' order by v_deal_program.program) as combination,
+           count(*)::integer as program_count
+    from mktg.v_deal_program
+    group by v_deal_program.snapshot_date, v_deal_program.deal_id
+)
+select
+    i.snapshot_date,
     i.deal_id,
     d.deal_name,
     d.company_name,
@@ -645,19 +681,19 @@ WITH combos AS (
     d.vertical,
     c.combination,
     c.program_count,
-    COALESCE(( SELECT k.program
-           FROM mktg.config_program_keywords k
-          WHERE POSITION((k.keyword) IN (btrim(replace(replace(lower(i.campaign_name), 'campaign influence:'::text, ''::text), 'campaign influence :'::text, ''::text)))) > 0
-          ORDER BY k.eval_order, k.id
-         LIMIT 1), 'Content & Technology'::text) AS program,
+    coalesce(p.program, 'Content') as program,
     i.contact_id,
     i.contact_name,
     i.contact_email,
     i.campaign_id,
     i.campaign_name
-   FROM mktg.snap_influence i
-     JOIN mktg.snap_sourced_deal d ON d.snapshot_date = i.snapshot_date AND d.deal_id = i.deal_id
-     JOIN combos c ON c.snapshot_date = i.snapshot_date AND c.deal_id = i.deal_id;;
+from mktg.snap_influence i
+join mktg.snap_sourced_deal d
+  on d.snapshot_date = i.snapshot_date and d.deal_id = i.deal_id
+join combos c
+  on c.snapshot_date = i.snapshot_date and c.deal_id = i.deal_id
+left join mktg.config_campaign_type_program p
+       on p.campaign_type = i.campaign_type;;
 
 -- -----------------------------------------------------------------------
 -- v_latest_snapshot

@@ -9,6 +9,15 @@ functions own all aggregation.
 - `is_single_program` is false for uninfluenced (null program) and
   multi-program deals. All sourced-pipeline metrics currently exclude both.
   This governs the headline number and was previously undocumented.
+  SCOPE, clarified 2026-09-15: this rule governs `f_sourced_by_program` /
+  `snap_sourced_deal` (Net New / "sourced") ONLY. The influence side
+  (`f_influenced_by_program`, `f_influenced_pipeline`, `v_deal_program`)
+  never had an exclusivity rule for its overall total and, as of
+  2026-09-15, has no exclusivity concept anywhere - see "Real
+  campaign_type" below. Do not assume a change to one side implies the
+  other; they now use different classification mechanisms entirely
+  (keyword-guessed `campaign_name` for sourced, real HubSpot
+  `campaign_type` for influence).
 - The contacts-by-stage funnel is COUNTS ONLY. Ratified 2026-09-02.
   `snap_sourced_contact.influenced_value` was removed rather than fixed.
   It held the full amount of every Net New deal a contact touched, so two
@@ -202,6 +211,132 @@ functions own all aggregation.
   a window function) - `f_event_roi` computes the median as a `GROUP BY`
   aggregate in its own CTE, joined back by `snapshot_date`, not as a window
   function over the per-event rows directly.
+
+- WEBINARS PROGRAM, added 2026-09-15 (SUPERSEDED ON THE INFLUENCE SIDE
+  the same day - see "Real campaign_type" below. `f_influenced_by_program`
+  no longer reads `config_program_keywords` at all, and its 10-bucket
+  `programs` list replaced the 5-bucket one this entry describes. This
+  entry's `f_sourced_by_program` / sourced-pipeline content is still
+  accurate and current; read its influence-side content as history, not
+  current behavior). Webinar campaigns previously fell
+  into the Content & Technology catch-all because no keyword in
+  `PROGRAM_KEYWORDS` matched them. `generate_netnew_report.PROGRAM_KEYWORDS`
+  now has a fifth entry, `("Webinars", 4, ("webinar",))`, and
+  `f_sourced_by_program` / `f_influenced_by_program` each have a fifth row
+  in their `programs` VALUES list. See
+  `docs/migrations/2026-09-15_add_webinars_program.sql`.
+  TWO SPEEDS, BY DESIGN: `f_influenced_by_program` /
+  `f_influenced_pipeline` / `f_influenced_by_combination` read
+  `v_deal_program`, which classifies from `config_program_keywords` at
+  QUERY time, so every historical snapshot's influenced-by-program numbers
+  moved the moment `--sync-keywords` ran - Content & Technology's
+  historical total dropped by whatever was Webinar-only. `f_sourced_by_program`
+  reads `snap_sourced_deal.program` / `.is_single_program`, which
+  `generate_netnew_report.py` computes in Python and freezes into the row
+  at ETL write time - already-written snapshot_dates keep their old
+  classification. Sourced-by-program only shows Webinars from the next
+  daily run's new `snapshot_date` forward. A backfill of historical
+  `snap_sourced_deal` rows to match was considered and deliberately not
+  done - prospective-only was judged sufficient and a backfill would be a
+  bigger, less reversible rewrite of already-written snapshot data.
+  `compute_slide15_grain` in `generate_netnew_report.py` reproduces a FIXED
+  July 2026 offsite slide with only the original four buckets
+  (`PROGRAMS`/`SLIDE15`) - it folds any Webinars-classified deal into
+  Content & Technology rather than adding a fifth bucket, so that frozen
+  historical comparison doesn't move. The Lovable dashboard (`msa-dash-pro`,
+  separate project) still needs updating to expect a fifth program row -
+  not done as part of this change, same open item pattern as the
+  single-program label change noted below.
+
+- REAL campaign_type, wired in 2026-09-15. HubSpot added a genuine custom
+  property, `campaign_type`, on the NATIVE Marketing Campaign object (not
+  the Campaign Influence Lists this ETL reads directly) - a controlled
+  24-value picklist (Case Study, Collateral, Email - Bespoke, Email -
+  Database, External Contributed Article, External Event, Organic Social,
+  Outsourced SDR, Paid Search, Paid Social, PR, Product Launch, Research
+  Paper, Survey, Video, Web Ads - External, Web Ads - Own, Web Content -
+  ICI, Web Content, Webinar, Webinar - Own, Website Form - ICI, Website
+  Form, Whitepaper), backfilled and populated. Reading it needed the
+  `marketing.campaigns.read` scope added to the HUBSPOT_TOKEN private app
+  - without it, `/marketing/v3/campaigns/*` 403s outright.
+  THE LINK: each Campaign Influence list's filter branch contains a
+  `hs_marketing_campaign_object_id` filter whose value's last
+  `-`-separated segment is that native Campaign's `hs_object_id` -
+  verified live against list 4463 ("MSAI 2026 Blog Content" ->
+  campaign_type "Web Content"). `generate_report.pull_native_campaigns()`
+  / `list_linked_campaign_type()` do this resolution; `classify_campaign()`
+  (the old name-keyword guess) is now FALLBACK ONLY, for the 8 paid-ad
+  lists (LinkedIn/Google/Meta) built on ad-platform filters with no
+  Campaign link, plus any similarly orphaned list (1 found 2026-09-15,
+  "Partnerships 2026" - its linked object id wasn't among the 115
+  campaigns fetched, likely archived).
+  ONE REAL SURPRISE, worth remembering when a program number looks off:
+  "Campaign Influence: 7x24 Exchange Tradeshow" is named like an event,
+  but its linked Campaign's campaign_type is "External Contributed
+  Article" (the actual campaign is a magazine byline). Trusting the real
+  property over the list's own name is the whole point of this change -
+  don't "fix" a case like this back to matching the name.
+  `generate_report.CAMPAIGN_TYPE_PROGRAM` groups the 24 real values (plus
+  classify_campaign()'s 4 fallback-only outputs: Blog, Event, Form,
+  Content) into 10 broader INFLUENCE-side program buckets: Content
+  (web content, collateral, case studies, whitepapers, research papers,
+  video, surveys, blog), Webinars, Events (external + internal/onboarding
+  - "Event - Internal", e.g. Amazon Onboarding & Training, is INCLUDED
+  deliberately per Alecia: onboarding matters for adoption), Web Forms,
+  Product Launch, PR & Media (PR + contributed articles), Email,
+  Organic Social, Advertising, Outsourced SDR (kept as its own bucket,
+  not folded into anything, per Alecia: "we see it as a campaign"). THE
+  SINGLE SOURCE for `mktg.config_campaign_type_program` -
+  `sync_to_mktg.py --sync-campaign-types` reconciles that table to this
+  dict exactly, same add/update/remove pattern as
+  `--sync-keywords` / `config_program_keywords`. Edit groupings ONLY in
+  the Python dict. Wired into the daily workflow, `continue-on-error`,
+  same as the keyword sync.
+  Deliberately separate from `generate_netnew_report.PROGRAM_KEYWORDS`,
+  which still governs the unchanged sourced-pipeline side - see the
+  ratified-rules note above.
+  MECHANISM CHANGE: `v_deal_program` now joins
+  `snap_influence.campaign_type` (real value, frozen per snapshot at ETL
+  time) against `config_campaign_type_program`, instead of
+  POSITION()-matching keywords in `campaign_name` at query time. This
+  means influence classification is now ALSO frozen per snapshot going
+  forward (not query-time-retroactive the way it was through
+  2026-09-15) - a new daily run's snapshot picks up whatever
+  `campaign_type` HubSpot holds that day; an old snapshot's rows keep
+  whatever `campaign_type` was frozen in when they were written.
+  `v_influenced_deal_detail`'s per-row `program` column had its own
+  separate inline keyword lookup (duplicating v_deal_program's logic at
+  row grain) - also moved to the same join, so the two can't disagree.
+  EXCLUSIVITY RETIRED FOR INFLUENCE. The old sourced-style rule (every
+  touch must map to the same program, or the deal is excluded) was NEVER
+  actually load-bearing for `f_influenced_pipeline`'s overall total - that
+  already counted each influenced deal once regardless of touch count.
+  It WAS the reason `f_influenced_by_program`'s per-program breakdown kept
+  shrinking toward uselessness as buckets got more precise: at full
+  ~20-bucket granularity (verified live 2026-09-15, ex-Amazon), single-
+  program deals fell to 50 / $1.6M while PR, Case Study, Whitepaper,
+  Research Paper, Video, Collateral, Web Content, Paid Search/Ads,
+  Outsourced SDR, Survey, and Email all showed a permanent $0 - not
+  because there was no activity, but because those types essentially
+  never occur as a deal's ONLY touch. Decided 2026-09-15: touch breadth
+  is a metric to report, not a filter. Verified live: deals touched by
+  3+ programs carried $6,487,418 across 37 deals - more than the 50
+  single-program ($1,596,205) and 21 two-program ($1,198,645) deals
+  combined. Hiding multi-touch deals was hiding the biggest ones.
+  `mktg.v_deal_touch_summary` (new view) answers "how many campaigns (and
+  which programs) influenced this deal" directly: one row per
+  (snapshot_date, deal_id) with `campaign_count` (distinct Campaign
+  Influence lists), `program_count` (distinct broader programs), and
+  `programs` (array of which). No deal is ever excluded from it.
+  `f_influenced_by_program`'s `programs` VALUES list moved from the old 5
+  (Content & Technology / Events / Advertising / PR & Brand / Webinars) to
+  the new 10 above - same `not_measured` genuine-zero mechanism via
+  `config_settings.unmeasured_programs`, unchanged.
+  NOT IN SCOPE, and not done here: "sourced" pipeline (was this deal's
+  CONTACT'S lead source marketing-originated) is a different question
+  entirely from campaign influence, and needs its own future project
+  mapping HubSpot Lead Source values - not a campaign classification
+  problem, and not solved by anything in this entry.
 
 ## Window anchor
 
