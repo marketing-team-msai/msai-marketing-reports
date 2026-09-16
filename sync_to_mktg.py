@@ -555,8 +555,20 @@ def rows_sourced_deal(snapshot_date, ds, owners):
             "owner_name": owners.get(oid, ""),
             "vertical": d.get("vertical") or UNKNOWN_VERTICAL,
             "sub_vertical": d.get("sub_vertical") or UNKNOWN_VERTICAL,
-            "program": d.get("program") or None,
-            "is_single_program": bool(d.get("single_program")),
+            # program / is_single_program are placeholders here (None / False)
+            # deliberately, not d.get("program") / d.get("single_program") -
+            # those are the retired keyword-over-campaign_name classification,
+            # kept only for the Excel workbook's own in-memory use
+            # (compute_slide15_grain, campaign summary), never written to this
+            # column since 2026-09-16. The real value is written immediately
+            # after by repoint_sourced_program(), from mktg.v_deal_program
+            # (real HubSpot campaign_type through config_campaign_type_program)
+            # - see CLAUDE.md "Marketing Sourced" and
+            # docs/migrations/2026-09-16_sourced_program_from_campaign_type.sql.
+            # A day whose repoint step is skipped (no snap_influence rows yet)
+            # simply leaves these at None/False rather than a stale guess.
+            "program": None,
+            "is_single_program": False,
             "is_closed_won": bool(d.get("won")),
             "is_closed": bool(d.get("closed")),
             "is_amazon": bool(d.get("amazon")),
@@ -1033,6 +1045,112 @@ def sync_lead_source_bucket(dry_run=False):
     return changes
 
 
+# ------------------------------------------ sourced program (repoint) --------
+# snap_sourced_deal.program / is_single_program used to be the retired
+# keyword-over-campaign_name classification (generate_netnew_report.
+# classify_program / PROGRAM_KEYWORDS), frozen in Python at ETL time. As of
+# 2026-09-16 they are instead derived from mktg.v_deal_program - the SAME
+# real-campaign_type-through-config_campaign_type_program mechanism the
+# influence side already uses - collapsed to one value per deal. This makes
+# the "Program" column consistent everywhere it is shown, including on the
+# new Marketing Sourced page. See CLAUDE.md and
+# docs/migrations/2026-09-16_sourced_program_from_campaign_type.sql.
+#
+# Deliberately query-time-derived-then-written, not query-time-only: writing
+# it into snap_sourced_deal keeps every existing consumer of that column
+# (f_sourced_by_program, is_single_program's exclusivity, this table's own
+# ON_CONFLICT-based upsert history) working exactly as before, mechanism
+# aside. Nothing here hardcodes the program list - it reads whatever
+# mktg.v_deal_program / config_campaign_type_program currently define.
+FIRST_CAMPAIGN_TYPE_SNAPSHOT = "2026-09-15"  # see repoint_sourced_program()
+
+def sourced_program_rows(snapshot_date):
+    """One (program, is_single_program) pair per deal_id, collapsed from
+    mktg.v_deal_program for this snapshot_date: exactly one distinct program
+    -> that program; more than one -> '(multi)'. A deal_id absent here has no
+    influence at all for this snapshot_date - repoint_sourced_program() below
+    leaves those at program=None, is_single_program=False."""
+    rows = sb_select("v_deal_program",
+                     "select=deal_id,program&snapshot_date=eq.%s" % snapshot_date)
+    by_deal = defaultdict(set)
+    for r in rows:
+        by_deal[r["deal_id"]].add(r["program"])
+    out = {}
+    for did, progs in by_deal.items():
+        out[did] = (next(iter(progs)), True) if len(progs) == 1 else ("(multi)", False)
+    return out
+
+
+def repoint_sourced_program(snapshot_date, dry_run=False):
+    """Rewrite snap_sourced_deal.program / is_single_program for one
+    snapshot_date from mktg.v_deal_program, in place - deal_id and every
+    other column are untouched (sb_upsert's merge-duplicates only SETs the
+    columns present in the payload).
+
+    Skips (prints why, changes nothing) rather than guessing when:
+      - snap_sourced_deal has no rows for this date, or
+      - snap_influence has no rows for this date yet (v_deal_program would
+        be empty, and blanket-resetting every deal to uninfluenced would be
+        wrong, not merely incomplete), or
+      - the date predates FIRST_CAMPAIGN_TYPE_SNAPSHOT, i.e. snap_influence.
+        campaign_type for that date was frozen before the real-campaign_type
+        pull went live and does not reliably join against
+        config_campaign_type_program - see CLAUDE.md "Real campaign_type".
+        These are left exactly as they were (whatever the retired
+        keyword-based classification wrote), per Alecia's explicit call
+        2026-09-16 not to guess at pre-cutover dates."""
+    if snapshot_date < FIRST_CAMPAIGN_TYPE_SNAPSHOT:
+        print("     skip   %s: predates real campaign_type (%s) - left alone"
+              % (snapshot_date, FIRST_CAMPAIGN_TYPE_SNAPSHOT))
+        return 0
+
+    deal_ids = [r["deal_id"] for r in
+               sb_select("snap_sourced_deal",
+                        "select=deal_id&snapshot_date=eq.%s" % snapshot_date)]
+    if not deal_ids:
+        print("     skip   %s: no snap_sourced_deal rows" % snapshot_date)
+        return 0
+
+    has_influence = sb_select("snap_influence",
+                              "select=deal_id&snapshot_date=eq.%s&limit=1"
+                              % snapshot_date)
+    if not has_influence:
+        print("     skip   %s: no snap_influence rows yet" % snapshot_date)
+        return 0
+
+    mapping = sourced_program_rows(snapshot_date)
+    patch = []
+    for did in deal_ids:
+        program, single = mapping.get(did, (None, False))
+        patch.append({"snapshot_date": snapshot_date, "deal_id": did,
+                     "program": program, "is_single_program": single})
+
+    classified = sum(1 for p in patch if p["program"] and p["program"] != "(multi)")
+    multi = sum(1 for p in patch if p["program"] == "(multi)")
+    uninfluenced = sum(1 for p in patch if not p["program"])
+    print("     %s: %d deal(s) - %d single-program, %d multi, %d uninfluenced"
+          % (snapshot_date, len(patch), classified, multi, uninfluenced))
+    if dry_run:
+        print("     dry    would upsert %d row(s)" % len(patch))
+        return len(patch)
+
+    sb_upsert("snap_sourced_deal", patch)
+    return len(patch)
+
+
+def backfill_sourced_program(dry_run=False):
+    """Run repoint_sourced_program() for every existing snapshot_date, oldest
+    first. Idempotent - a date already matching mktg.v_deal_program just gets
+    rewritten to the same values."""
+    dates = [r["snapshot_date"] for r in
+            sb_select("run_log", "select=snapshot_date&order=snapshot_date.asc")]
+    print("backfill_sourced_program: %d snapshot_date(s) on file" % len(dates))
+    total = 0
+    for d in dates:
+        total += repoint_sourced_program(d, dry_run=dry_run)
+    return total
+
+
 # -------------------------------------------------------- schema check -------
 # PostgREST advertises the Postgres type of every column as `format`, and marks
 # primary and foreign keys inside `description`. These are the Python types a
@@ -1430,6 +1548,10 @@ def main():
     ap.add_argument("--sync-lead-source-buckets", action="store_true",
                     help="reconcile mktg.config_lead_source_bucket to match "
                          "generate_netnew_report.LEAD_SOURCE_BUCKET, then exit")
+    ap.add_argument("--backfill-sourced-program", action="store_true",
+                    help="rewrite snap_sourced_deal.program/is_single_program "
+                         "for every existing snapshot_date from "
+                         "mktg.v_deal_program, then exit")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1459,6 +1581,14 @@ def main():
         else:
             print("DRY RUN - computing the lead_source bucket diff, writing nothing")
         sync_lead_source_bucket(dry_run=args.dry_run)
+        sys.exit(0)
+    if args.backfill_sourced_program:
+        init_creds()
+        if not args.dry_run:
+            _require_creds()
+        else:
+            print("DRY RUN - computing the program diff, writing nothing")
+        backfill_sourced_program(dry_run=args.dry_run)
         sys.exit(0)
 
     init_creds()
@@ -1496,6 +1626,27 @@ def main():
             failures += 1
             notes.append("%s failed: %s" % (name, str(e)[:120]))
             print("FAIL   %s: %s" % (name, e), file=sys.stderr)
+
+    # Repoints snap_sourced_deal.program/is_single_program for TODAY's
+    # snapshot_date from mktg.v_deal_program, now that both influence and
+    # netnew have written today's rows (repoint_sourced_program() itself
+    # no-ops with a printed reason if either is missing). Only attempted
+    # when both ran in this invocation - e.g. `--only netnew` alone leaves
+    # today's classification for a later full run to fill in, rather than
+    # blanking it against whatever influence data happened to already exist
+    # from a previous run.
+    ran = {name for name, _ in jobs}
+    if {"influence", "netnew"} <= ran:
+        print("[day] repointing sourced program from v_deal_program ...")
+        try:
+            repoint_sourced_program(snapshot_date, dry_run=args.dry_run)
+        except Exception as e:
+            failures += 1
+            notes.append("repoint_sourced_program failed: %s" % str(e)[:120])
+            print("FAIL   repoint_sourced_program: %s" % e, file=sys.stderr)
+    else:
+        print("[day] skipping program repoint - needs both influence and "
+              "netnew in the same run (this run: %s)" % ", ".join(sorted(ran)))
 
     print("[day] closing run_log row ...")
     day_failed = False

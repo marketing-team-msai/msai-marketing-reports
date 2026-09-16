@@ -577,14 +577,124 @@ same reasoning as every other prospective-only change here - rewriting
 already-written snapshot rows is bigger and less reversible than letting
 the population build going forward.
 
-DOES NOT TOUCH the sourced side's existing objects: `f_sourced_by_program`,
-`is_single_program`, `config_program_keywords`, `PROGRAM_KEYWORDS` are
-unchanged and still answer their own question (campaign touch breadth).
+AT THE TIME THIS WAS WRITTEN (2026-09-16, before the repoint below),
+this did not touch `f_sourced_by_program` / `is_single_program` /
+`config_program_keywords` / `PROGRAM_KEYWORDS` - see "Sourced program
+repointed to real campaign_type" immediately below for why that changed
+the very next day, and what did and did not move as a result.
 The Lovable dashboard's OLD "Net New / Sourced" page (single-program /
 multi-program) still needs to be pointed at the new objects above and
 the old framing retired from that page - a separate, not-yet-done change
 in `msa-dash-pro`, same open-item pattern as every prior label change
 noted elsewhere in this file.
+
+## Sourced program repointed to real campaign_type (reverses a 2026-09-15 boundary)
+
+WIRED IN 2026-09-16, same day as Marketing Sourced above, as a direct
+follow-up to it. The Marketing Sourced page surfaced a real
+inconsistency: its per-deal "Program" and "By Program" breakdown read
+`snap_sourced_deal.program`, which still held the RETIRED keyword-over-
+campaign_name classification (Content & Technology / Events /
+Advertising / PR & Brand / Webinars) - so the same deal could show
+"Content & Technology" on one part of the page next to "Content" or
+"Web Forms" from the real-campaign_type-based influence side. Alecia
+asked for `snap_sourced_deal.program` / `is_single_program` to be
+repointed at the same `v_deal_program` mechanism the influence side has
+used since 2026-09-15.
+
+THIS DELIBERATELY REVERSES THE "DO NOT TOUCH" BOUNDARY the 2026-09-15
+campaign_type migration drew around `f_sourced_by_program`,
+`snap_sourced_deal`, and `is_single_program` ("a genuinely different
+question... pending its own future rework"). That boundary was the
+right call at the time; this is an explicit, informed follow-up
+decision, not a correction of a mistake. Before proceeding, Alecia was
+told the concrete consequences and chose to proceed anyway:
+  - `f_sourced_by_program` hardcoded the OLD 5-bucket list in its own
+    `programs` CTE. Left alone, it would have silently UNDERCOUNTED
+    (not relabeled) any deal now falling under a new-taxonomy-only name
+    (Content, Web Forms, Product Launch, Organic Social, Outsourced
+    SDR, Email, PR & Media) - those deals would match none of the 5
+    hardcoded rows and vanish from every per-program total. Fixed in
+    the same migration (below).
+  - `is_single_program`'s exclusivity is now evaluated against the
+    finer 10-bucket real-campaign_type taxonomy instead of the old 4/5
+    buckets - the same mechanism change that measurably shrank the
+    single-program population on the INFLUENCE side (see "Real
+    campaign_type" above: 71 -> 60 -> 51 -> 50 ex-Amazon as buckets got
+    finer). Confirmed live 2026-09-16: sourced went from 61 deals under
+    the single "Content & Technology" bucket to 36 Content + 16 Web
+    Forms, with 9 of the old 61 moving into `(multi)` instead (48 -> 57
+    multi-program deals). `f_sourced_by_program`'s row_type='program'
+    headline moved from the old figure to 58 deals / $2,030,155, with
+    57 multi-program deals worth $7,616,063 in the reconciling row.
+    Exclusivity itself was NOT retired here (unlike the influence side)
+    - `is_single_program` still means exactly what ratified rule 1 always
+    said, just evaluated against the current taxonomy.
+
+WHAT CHANGED, MECHANICALLY:
+  - `generate_netnew_report.py`: NO CHANGE. `classify_program()` /
+    `PROGRAM_KEYWORDS` / `PROGRAMS` / `compute_slide15_grain()` are
+    untouched - they remain the Excel workbook's own in-memory
+    classification for that separate deliverable, per its own
+    docstring. They are simply no longer written to Supabase.
+  - `sync_to_mktg.rows_sourced_deal()`: `program` / `is_single_program`
+    now write `None` / `False` placeholders instead of
+    `d.get("program")` / `d.get("single_program")`.
+  - `sync_to_mktg.repoint_sourced_program(snapshot_date)` (new): reads
+    `mktg.v_deal_program` for that date (unchanged view - already the
+    correct derivation), collapses to one `(program, is_single_program)`
+    pair per deal, and writes ONLY those two columns into
+    `snap_sourced_deal`. Nothing here hardcodes the program list.
+    `FIRST_CAMPAIGN_TYPE_SNAPSHOT = '2026-09-15'` - dates before this
+    are skipped, not guessed at, because `snap_influence.campaign_type`
+    for those dates was frozen before the real-campaign_type pull went
+    live and does not reliably join through
+    `config_campaign_type_program`.
+  - Wired into the daily run automatically, right after both the
+    influence and netnew jobs finish in the same invocation (skipped,
+    not guessed, if a run only includes one of them - e.g. `--only
+    netnew` alone).
+  - `sync_to_mktg.py --backfill-sourced-program` (new flag): reran this
+    for every existing `snapshot_date`. 2026-09-02 through 2026-09-14
+    were left alone (predate real `campaign_type`); 2026-09-15 and
+    2026-09-16 were rewritten.
+  - `mktg.f_sourced_by_program`: its `programs` CTE changed from a
+    hardcoded VALUES list to `select distinct program from
+    config_campaign_type_program` - everything else about the function
+    (row_type discipline, the `(multi)` reconciling row, the
+    `not_measured` mechanism) is unchanged. `v_sourced_by_program` picks
+    this up automatically (one body, as always).
+
+A REAL BUG WAS CAUGHT AND FIXED DURING THIS ROLLOUT, worth remembering
+as a general caution: the first version of the `programs` CTE above
+wrote `select distinct program, row_number() over (order by program)...
+from config_campaign_type_program` - since `row_number()` is a window
+function evaluated per underlying row (one row per `campaign_type`, ~24
+of them) BEFORE `distinct` can collapse anything, every row got its own
+number and `distinct` had nothing left to deduplicate: each program
+came back once per campaign_type that maps to it (Content appeared 10
+times, for instance), all with identical counts and dollars, which
+would have multiplied `f_pipeline_model`'s sum by however many
+campaign_types shared a program. Caught by inspecting live output
+before the backfill ran, not by test coverage - there is no automated
+test over this SQL function. Fixed by collapsing to distinct program
+names in a subquery BEFORE applying `row_number()`. If a future
+`f_*`/`v_*` object here ever needs "number these distinct values,"
+apply `distinct` first, in its own subquery - never in the same
+`select` list as the window function.
+
+WHAT DOES NOT CHANGE: `v_deal_program`, `f_influenced_by_program`,
+`v_deal_touch_summary`, `config_campaign_type_program`,
+`generate_report.CAMPAIGN_TYPE_PROGRAM` - all untouched, all already
+correct. `f_marketing_sourced_by_program` needed NO change - it already
+read `snap_sourced_deal.program`, which this repoint makes correct at
+the source instead of requiring its own query-time join.
+`config_program_keywords` / `PROGRAM_KEYWORDS` are left in place
+(harmless, nothing in `mktg` reads them anymore) rather than dropped -
+same "leave it, drop by hand only if certain" convention as
+`config_campaign_type_program` was left in the 2026-09-15 down
+migration. See
+`docs/migrations/2026-09-16_sourced_program_from_campaign_type.sql`.
 
 ## Open items
 
