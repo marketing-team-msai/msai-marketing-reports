@@ -489,6 +489,103 @@ path. Nothing in the Campaign Influence lists carries it, and `snap_ad_source`
 has no deal_id - it is spend/clicks/conversions by source and account, not
 attribution.
 
+## Marketing Sourced (replaces the old "Net New / Sourced" page)
+
+WIRED IN 2026-09-16. Alecia flagged that the "Net New / Sourced" page was
+being read as "was this deal marketing-sourced" when `is_single_program` /
+`f_sourced_by_program` actually measure something else entirely: whether
+every campaign touching a deal's contacts happened to map to ONE program
+bucket. That is campaign touch breadth, not opportunity origin, and
+neither concept anywhere in this schema looked at deal type or contact
+lead source before this - both were flagged as future work back in the
+2026-09-15 campaign_type migration ("the Net New/'sourced' side is a
+genuinely different question... pending its own future rework") and
+confirmed as genuinely absent by a live grep before building this.
+
+THE ACTUAL QUESTION, per Alecia 2026-09-16: for a NEW BUSINESS deal, does
+the associated contact's lead source indicate marketing origin (e.g.
+Trade Show), AND did a marketing campaign actually touch the deal. BOTH
+signals are required to agree - not either-or, not lead-source-primary.
+A deal with only one signal is real and reportable, just not counted as
+Marketing Sourced.
+
+TWO NEW HUBSPOT PULLS, neither existed before this:
+- `dealtype` (deal property, picklist): `newbusiness` / `existingbusiness`
+  / `Renewal`. Renewal groups with Existing Business as repeat business,
+  per Alecia - not its own bucket, not excluded.
+- `lead_source` (CONTACT property - a custom MSAI picklist, NOT the
+  standard `hs_analytics_source` "Original Traffic Source", and NOT the
+  near-empty `lead_source__c` that lives on the deal). Confirmed live
+  against the portal's Properties API 2026-09-16: `lead_source` has 33
+  values including "Trade Show", "Trade Show Lead", "Outsourced SDR",
+  "Cold Call", etc - `hs_analytics_source` is a different, HubSpot-
+  standard, auto-tracked field with only 10 broad values (Organic
+  Search, Paid Search, Email Marketing, ...). Do not conflate the two.
+  There is also `hs_sourced_contact_origin` on contacts - that is which
+  SALES-PROSPECTING TOOL (Apollo, ZoomInfo, Seamless, LinkedIn, ...)
+  sourced the contact, unrelated to marketing origin. Not used here.
+
+`generate_netnew_report.LEAD_SOURCE_BUCKET` is THE SINGLE SOURCE for
+lead_source -> bucket (marketing / sales / other), same
+generated-mirror pattern as `PROGRAM_KEYWORDS` /
+`CAMPAIGN_TYPE_PROGRAM`: `mktg.config_lead_source_bucket` is reconciled
+by `sync_to_mktg.py --sync-lead-source-buckets`, wired into the daily
+workflow with the same `continue-on-error` treatment as the other two
+keyword/mapping syncs. Edit bucket assignments ONLY in the Python dict.
+Ratified bucket calls, per Alecia 2026-09-16 (the ones that are not
+obvious from the label alone): Outsourced SDR, Email, Incoming Email,
+Incoming Call, Referral, and AI Assistants/Browser all count as
+marketing; Reliabilityweb and WTWH Media (media-partner content) count
+as marketing; "List Vendor" (label "List Upload or Vendor") counts as
+SALES, not marketing, unless a specific list is confirmed to be event-
+attendee sourced - no such override mechanism exists yet, a plausible
+fast-follow.
+
+`snap_sourced_deal` gains 7 columns, computed once in Python at ETL
+write time (same frozen-per-snapshot treatment `program` /
+`is_single_program` already have on this table - see the Webinars
+gotcha above for why that matters): `deal_type`, `is_new_business`,
+`has_marketing_lead_source`, `marketing_lead_sources` (text[], every
+distinct marketing-bucketed lead_source value across ALL of the deal's
+associated contacts, any contact counts - reported for transparency,
+NEVER summed), `primary_lead_source` (the one such value from whichever
+contact was created earliest - exclusive per deal, this is what
+by-lead-source dollar breakdowns group on, the same exclusivity trick
+`is_single_program` relies on for by-program breakdowns), `marketing_sourced`
+(bool), and `sourcing_status` - one of `marketing_sourced`,
+`partial_lead_source_only`, `partial_campaign_only`,
+`not_marketing_sourced`, `repeat_business`, `unknown_deal_type`. The two
+`partial_*` statuses are kept visible on purpose - a deal where the two
+signals disagree is exactly the interesting case, not noise to average
+into `not_marketing_sourced`.
+
+THREE NEW QUERY OBJECTS, all EVERY-`snapshot_date` / filter-server-side
+the same as every other `f_*`/`v_*` here: `f_marketing_sourced`
+(-> `v_marketing_sourced`) is the headline, one row per
+`(snapshot_date, sourcing_status)`. `f_marketing_sourced_by_lead_source`
+(-> `v_marketing_sourced_by_lead_source`) and
+`f_marketing_sourced_by_program` (-> `v_marketing_sourced_by_program`)
+both filter to `sourcing_status = 'marketing_sourced'` only and group on
+`primary_lead_source` / `program` respectively - both exclusive per deal,
+so both sum safely. See `docs/migrations/2026-09-16_marketing_sourced.sql`.
+
+PROSPECTIVE ONLY, same precedent as Webinars (2026-09-15): `deal_type`
+and `lead_source` were never pulled before this, so every already-
+written `snapshot_date` shows 100% `unknown_deal_type` until the next
+daily run writes a new one. Not a bug; no backfill was scoped or done,
+same reasoning as every other prospective-only change here - rewriting
+already-written snapshot rows is bigger and less reversible than letting
+the population build going forward.
+
+DOES NOT TOUCH the sourced side's existing objects: `f_sourced_by_program`,
+`is_single_program`, `config_program_keywords`, `PROGRAM_KEYWORDS` are
+unchanged and still answer their own question (campaign touch breadth).
+The Lovable dashboard's OLD "Net New / Sourced" page (single-program /
+multi-program) still needs to be pointed at the new objects above and
+the old framing retired from that page - a separate, not-yet-done change
+in `msa-dash-pro`, same open-item pattern as every prior label change
+noted elsewhere in this file.
+
 ## Open items
 
 - Every logged-in employee can read all of `mktg` directly. `authenticated`

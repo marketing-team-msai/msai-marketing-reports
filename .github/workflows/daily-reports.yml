@@ -88,6 +88,17 @@ jobs:
         continue-on-error: true
         run: python sync_to_mktg.py --sync-campaign-types
 
+      # Same drift-prevention pattern, for the NET NEW / marketing-sourced
+      # side's lead_source -> bucket mapping: reconciles
+      # mktg.config_lead_source_bucket to
+      # generate_netnew_report.LEAD_SOURCE_BUCKET. Not read by any view
+      # (the bucket is frozen into snap_sourced_deal in Python at write
+      # time, same as program/is_single_program always have been) - this
+      # exists purely so the mapping can be audited in SQL.
+      - name: Sync lead source buckets
+        continue-on-error: true
+        run: python sync_to_mktg.py --sync-lead-source-buckets
+
       - name: Sync to mktg
         run: |
           ARGS=""

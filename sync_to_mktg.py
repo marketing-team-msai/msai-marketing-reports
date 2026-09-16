@@ -17,6 +17,13 @@ never computes or stores them.
   netnew     generate_netnew_report.py  -> mktg.snap_sourced_deal
                                            one row per Net New deal in the window,
                                            tagged is_single_program true or false
+                                           (campaign touch breadth) AND, since
+                                           2026-09-16, sourcing_status - is this
+                                           new business a contact's lead_source
+                                           AND campaign influence both point to
+                                           marketing origin. Two different
+                                           questions on the same table; see
+                                           docs/migrations/2026-09-16_marketing_sourced.sql
                                         -> mktg.snap_sourced_contact
                                            one row per marketing-sourced contact
   sla        generate_sla_report.py     -> mktg.snap_lead_sla
@@ -64,6 +71,8 @@ Usage
                                             to generate_netnew_report.py, network
   python sync_to_mktg.py --sync-campaign-types  reconcile config_campaign_type_program
                                             to generate_report.py, network
+  python sync_to_mktg.py --sync-lead-source-buckets  reconcile config_lead_source_bucket
+                                            to generate_netnew_report.py, network
   python sync_to_mktg.py --dry-run --sample 5   compute, print 5 rows, write nothing
   python sync_to_mktg.py --only influence   one report
   python sync_to_mktg.py                    all five
@@ -140,7 +149,9 @@ COLUMNS = {
         "stage", "close_date", "create_date", "company_id", "company_name",
         "owner_id", "owner_name", "vertical", "sub_vertical", "program",
         "is_single_program", "is_closed_won", "is_closed", "is_amazon",
-        "is_galco", "is_seeded",
+        "is_galco", "deal_type", "is_new_business", "has_marketing_lead_source",
+        "marketing_lead_sources", "primary_lead_source", "marketing_sourced",
+        "sourcing_status", "is_seeded",
     ],
     "snap_sourced_contact": [
         "snapshot_date", "contact_id", "email", "create_date", "lifecycle_stage",
@@ -550,6 +561,15 @@ def rows_sourced_deal(snapshot_date, ds, owners):
             "is_closed": bool(d.get("closed")),
             "is_amazon": bool(d.get("amazon")),
             "is_galco": bool(d.get("galco")),
+            "deal_type": d.get("deal_type") or None,
+            "is_new_business": d.get("is_new_business"),
+            "has_marketing_lead_source": bool(d.get("has_marketing_lead_source")),
+            # text[] in Postgres, same JSON-array-for-PostgREST-cast rule as
+            # snap_sourced_contact.programs below.
+            "marketing_lead_sources": d.get("marketing_lead_sources") or [],
+            "primary_lead_source": d.get("primary_lead_source"),
+            "marketing_sourced": bool(d.get("marketing_sourced")),
+            "sourcing_status": d.get("sourcing_status") or "unknown_deal_type",
             "is_seeded": IS_SEEDED,
         })
     return out
@@ -957,6 +977,62 @@ def sync_campaign_type_program(dry_run=False):
     return changes
 
 
+# ------------------------------------------------------ lead source bucket ----
+def lead_source_bucket_rows():
+    """Canonical (lead_source, bucket) rows, read straight from
+    netnew.LEAD_SOURCE_BUCKET - the single place this mapping is defined,
+    same pattern as program_keyword_rows() / campaign_type_program_rows()
+    above. Every lead_source maps to exactly one bucket by construction
+    (it's a dict), so there is no "listed twice" failure mode to guard."""
+    return [{"lead_source": k, "bucket": v}
+            for k, v in netnew.LEAD_SOURCE_BUCKET.items()]
+
+
+def sync_lead_source_bucket(dry_run=False):
+    """Reconcile mktg.config_lead_source_bucket to exactly match
+    generate_netnew_report.LEAD_SOURCE_BUCKET: add missing values, remove
+    retired ones, patch any whose bucket changed. Idempotent, same
+    reconcile-by-natural-key approach as the two syncs above."""
+    canonical = {r["lead_source"]: r for r in lead_source_bucket_rows()}
+    current = {r["lead_source"]: r for r in
+              sb_select("config_lead_source_bucket",
+                       "select=id,lead_source,bucket")}
+
+    to_add = [canonical[k] for k in canonical if k not in current]
+    to_remove = [current[k] for k in current if k not in canonical]
+    to_update = [(current[k]["id"], canonical[k]) for k in canonical
+                if k in current and current[k]["bucket"] != canonical[k]["bucket"]]
+
+    print("config_lead_source_bucket: %d live, %d canonical"
+          % (len(current), len(canonical)))
+    for r in to_add:
+        print("     add    %-30s -> %s" % (r["lead_source"], r["bucket"]))
+    for r in to_remove:
+        print("     remove %-30s -> %s" % (r["lead_source"], r["bucket"]))
+    for _id, r in to_update:
+        old = current[r["lead_source"]]
+        print("     update %-30s %s -> %s"
+              % (r["lead_source"], old["bucket"], r["bucket"]))
+
+    changes = len(to_add) + len(to_remove) + len(to_update)
+    if not changes:
+        print("     ok     already in sync")
+        return 0
+    if dry_run:
+        print("     dry    %d change(s), nothing written" % changes)
+        return changes
+
+    if to_add:
+        sb_upsert("config_lead_source_bucket", to_add)
+    for _id, r in to_update:
+        sb_patch("config_lead_source_bucket", "id=eq.%s" % _id,
+                {"bucket": r["bucket"]})
+    for r in to_remove:
+        sb_delete("config_lead_source_bucket", "id=eq.%s" % r["id"])
+    print("     ok     %d change(s) applied" % changes)
+    return changes
+
+
 # -------------------------------------------------------- schema check -------
 # PostgREST advertises the Postgres type of every column as `format`, and marks
 # primary and foreign keys inside `description`. These are the Python types a
@@ -1190,12 +1266,31 @@ def _fixture_rows():
         "cname": lambda c: {"C1": "Pat Buyer", "C2": "Alecia OBrien"}.get(c, ""),
     }
     ds_nn = {
-        "deals": {"D1": {"name": "D", "amount": 100.0, "pipeline": "P", "stage": "S",
-                         "close": "", "create": "2026-08-01", "company_id": "CO1",
-                         "company": "Acme", "owner_id": "77", "vertical": "Logistics",
-                         "sub_vertical": "Parcel", "program": "Events",
-                         "single_program": True, "won": True, "closed": True,
-                         "amazon": False, "galco": False}},
+        "deals": {
+            "D1": {"name": "D", "amount": 100.0, "pipeline": "P", "stage": "S",
+                   "close": "", "create": "2026-08-01", "company_id": "CO1",
+                   "company": "Acme", "owner_id": "77", "vertical": "Logistics",
+                   "sub_vertical": "Parcel", "program": "Events",
+                   "single_program": True, "won": True, "closed": True,
+                   "amazon": False, "galco": False, "deal_type": "newbusiness",
+                   "is_new_business": True, "has_marketing_lead_source": True,
+                   "marketing_lead_sources": ["Trade Show"],
+                   "primary_lead_source": "Trade Show",
+                   "marketing_sourced": True, "sourcing_status": "marketing_sourced"},
+            # Second row exercises the null/blank branch: no dealtype, no
+            # marketing lead source, uninfluenced - the shape that reaches
+            # is_new_business (nullable boolean) and marketing_lead_sources
+            # (empty array) most often in the live population.
+            "D2": {"name": "D2", "amount": 50.0, "pipeline": "P", "stage": "S",
+                   "close": "", "create": "2026-08-03", "company_id": "CO2",
+                   "company": "Beta", "owner_id": "77", "vertical": "Unknown",
+                   "sub_vertical": "Unknown", "program": None,
+                   "single_program": False, "won": False, "closed": False,
+                   "amazon": False, "galco": False, "deal_type": "",
+                   "is_new_business": None, "has_marketing_lead_source": False,
+                   "marketing_lead_sources": [], "primary_lead_source": None,
+                   "marketing_sourced": False, "sourcing_status": "unknown_deal_type"},
+        },
         "contact_campaigns": {"C1": {"Campaign Influence - Events"}},
         "d2c": {"D1": ["C1"]},
         "sourced_contacts": {"C1": {"email": "a@b.com", "createdate": "2026-08-02",
@@ -1332,6 +1427,9 @@ def main():
     ap.add_argument("--sync-campaign-types", action="store_true",
                     help="reconcile mktg.config_campaign_type_program to match "
                          "generate_report.CAMPAIGN_TYPE_PROGRAM, then exit")
+    ap.add_argument("--sync-lead-source-buckets", action="store_true",
+                    help="reconcile mktg.config_lead_source_bucket to match "
+                         "generate_netnew_report.LEAD_SOURCE_BUCKET, then exit")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1353,6 +1451,14 @@ def main():
         else:
             print("DRY RUN - computing the campaign_type diff, writing nothing")
         sync_campaign_type_program(dry_run=args.dry_run)
+        sys.exit(0)
+    if args.sync_lead_source_buckets:
+        init_creds()
+        if not args.dry_run:
+            _require_creds()
+        else:
+            print("DRY RUN - computing the lead_source bucket diff, writing nothing")
+        sync_lead_source_bucket(dry_run=args.dry_run)
         sys.exit(0)
 
     init_creds()

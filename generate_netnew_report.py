@@ -224,6 +224,80 @@ def classify_program(name):
 
 PROGRAMS = ["Content & Technology", "Events", "Advertising", "PR & Brand"]
 
+# --------------------------------------------------- lead-source classifier ---
+# Maps HubSpot contact property `lead_source` (a closed picklist, portal-
+# specific custom field - NOT the standard hs_analytics_source "Original
+# Traffic Source") to a bucket for the Marketing Sourced report. Exact-value
+# match, not substring: this picklist is closed (radio/select), unlike
+# PROGRAM_KEYWORDS' free-text campaign names.
+#
+# Confirmed with Alecia 2026-09-16, as part of replacing the old single-
+# program/multi-program "Net New / Sourced" page (which measured campaign
+# touch breadth, not deal origin) with a report that actually answers
+# whether marketing brought a deal's contacts into the CRM. See
+# docs/migrations/2026-09-16_marketing_sourced.sql.
+#
+# THE SINGLE SOURCE, same pattern as PROGRAM_KEYWORDS above:
+# mktg.config_lead_source_bucket is a generated mirror, reconciled by
+# `sync_to_mktg.py --sync-lead-source-buckets`. Edit bucket assignments
+# ONLY here.
+#
+# "List Vendor" (label "List Upload or Vendor") defaults to sales rather
+# than marketing per Alecia's own caveat: it should count as marketing when
+# the list is confirmed to be event-attendee sourced, but that can't be told
+# apart from the picklist value alone. No such override exists yet - a
+# plausible fast-follow, not built.
+LEAD_SOURCE_BUCKET = {
+    # marketing
+    "Organic Search": "marketing",
+    "Organic Social": "marketing",
+    "Paid Search": "marketing",
+    "Paid Social": "marketing",
+    "Email": "marketing",
+    "Outsourced SDR": "marketing",
+    "Trade Show": "marketing",              # label: "Trade Show List"
+    "Trade Show Lead": "marketing",
+    "Multisensorai.com": "marketing",       # label: "Website Form - Multisensorai.com"
+    "Webstore - Infraredcameras.com": "marketing",
+    "Web Form - MSAI Inspections": "marketing",
+    "MSAI com Chatbot": "marketing",        # label: "MSAI.com Chatbot"
+    "Reliabilityweb": "marketing",
+    "WTWH Media": "marketing",
+    "AI Assistants/Browser": "marketing",
+    "Incoming Email": "marketing",
+    "Incoming Call": "marketing",
+    "Referral": "marketing",
+    # sales / partner
+    "Cold Call": "sales",                   # label: "Cold Call / Business Dev"
+    "Partner Referral": "sales",
+    "FLIR Automation": "sales",
+    "FLIR Cores": "sales",
+    "Fotric": "sales",
+    "SSM": "sales",
+    "Manual Input into CRM": "sales",
+    "HubSpot Meeting Link": "sales",
+    "List Vendor": "sales",                 # label: "List Upload or Vendor"
+    # other / unmeasured
+    "Investor Referral": "other",
+    "Website - MSAI Investors": "other",
+    "Previous Database": "other",
+    "Browser Extension": "other",
+    "Other": "other",
+}
+
+def classify_lead_source(value):
+    """Bucket a raw HubSpot lead_source value. Unrecognized/blank values
+    default to 'other' rather than raising - this picklist can grow, and a
+    KeyError mid-sync would take down an otherwise-unrelated report. Callers
+    that care about drift should check membership in LEAD_SOURCE_BUCKET
+    themselves (see build_dataset's unknown_lead_sources tracking)."""
+    return LEAD_SOURCE_BUCKET.get((value or "").strip(), "other")
+
+# Deal Type values (HubSpot picklist `dealtype`). Renewal groups with
+# Existing Business as repeat business per Alecia, 2026-09-16.
+NEW_BUSINESS_VALUES = {"newbusiness"}
+REPEAT_BUSINESS_VALUES = {"existingbusiness", "Renewal"}
+
 def is_amazon(name):
     return "amazon" in (name or "").lower()
 def is_galco(name):
@@ -270,7 +344,7 @@ def pull_netnew_deals():
     ms = since_ms()
     props = ["dealname", "amount", "pipeline", "dealstage", "closedate", "createdate",
              "hs_is_closed_won", "hs_is_closed", "amount_in_home_currency",
-             "hubspot_owner_id"]
+             "hubspot_owner_id", "dealtype"]
     out, after = [], None
     while True:
         body = {"filterGroups": [{"filters": [
@@ -365,6 +439,7 @@ def build_dataset():
                    or (p.get("dealstage") in won_stage_ids),
             "closed": (str(p.get("hs_is_closed")).lower() == "true"),
             "owner_id": p.get("hubspot_owner_id") or "",
+            "deal_type": p.get("dealtype") or "",
         }
     print("      %d net-new deals, $%.0f total amount"
           % (len(deals), sum(x["amount"] for x in deals.values())), flush=True)
@@ -413,7 +488,7 @@ def build_dataset():
     print("[5/6] influenced-contact details ...", flush=True)
     contact_props = batch_read("contacts", contacts_needed,
         ["firstname", "lastname", "email", "createdate", "lifecyclestage",
-         "industry", "primary_subindustry_dropdown"]) if contacts_needed else {}
+         "industry", "primary_subindustry_dropdown", "lead_source"]) if contacts_needed else {}
 
     # Vertical is a CONTACT property. A deal takes the first non-null industry
     # among its associated contacts, and "Unknown" when none of them carries one.
@@ -429,6 +504,72 @@ def build_dataset():
                 break
         d["vertical"] = vert or "Unknown"
         d["sub_vertical"] = sub or "Unknown"
+
+    # ---- MARKETING SOURCED: new-business deals where a contact's lead_source
+    # indicates marketing origin AND a campaign influenced the deal (both
+    # signals required, per Alecia 2026-09-16). See LEAD_SOURCE_BUCKET above
+    # and docs/migrations/2026-09-16_marketing_sourced.sql.
+    #
+    # marketing_lead_sources holds every distinct marketing-bucketed
+    # lead_source value found among the deal's associated contacts (any
+    # contact counts, not only influenced ones) - reported for transparency,
+    # never used to sum dollars, same "touch breadth, don't exclude" rule as
+    # v_deal_touch_summary on the influence side. primary_lead_source is the
+    # single marketing-bucketed value from whichever of those contacts was
+    # created earliest, giving one exclusive value per deal so a by-lead-
+    # source dollar breakdown can sum without double counting - the same
+    # exclusivity trick single_program relies on for the by-program
+    # breakdown, applied here instead of to campaign touches.
+    unknown_lead_sources = set()
+    for did, d in deals.items():
+        mkt_hits = []   # (created_ms, lead_source_value)
+        for c in d2c.get(did, []):
+            cp = contact_props.get(c, {})
+            ls = (cp.get("lead_source") or "").strip()
+            if not ls:
+                continue
+            if ls not in LEAD_SOURCE_BUCKET:
+                unknown_lead_sources.add(ls)
+            if classify_lead_source(ls) != "marketing":
+                continue
+            cd = (cp.get("createdate") or "")[:10]
+            try:
+                cd_ms = (int(datetime.strptime(cd, "%Y-%m-%d")
+                             .replace(tzinfo=timezone.utc).timestamp() * 1000)
+                         if cd else 0)
+            except Exception:
+                cd_ms = 0
+            mkt_hits.append((cd_ms, ls))
+        mkt_sources = sorted({ls for _, ls in mkt_hits})
+        d["marketing_lead_sources"] = mkt_sources
+        d["has_marketing_lead_source"] = bool(mkt_sources)
+        d["primary_lead_source"] = min(mkt_hits)[1] if mkt_hits else None
+
+        if d["deal_type"] in NEW_BUSINESS_VALUES:
+            d["is_new_business"] = True
+        elif d["deal_type"] in REPEAT_BUSINESS_VALUES:
+            d["is_new_business"] = False
+        else:
+            d["is_new_business"] = None   # blank or an unrecognized dealtype value
+
+        if d["is_new_business"] is None:
+            status = "unknown_deal_type"
+        elif d["is_new_business"] is False:
+            status = "repeat_business"
+        elif d["has_marketing_lead_source"] and d["influenced"]:
+            status = "marketing_sourced"
+        elif d["has_marketing_lead_source"]:
+            status = "partial_lead_source_only"
+        elif d["influenced"]:
+            status = "partial_campaign_only"
+        else:
+            status = "not_marketing_sourced"
+        d["sourcing_status"] = status
+        d["marketing_sourced"] = (status == "marketing_sourced")
+    if unknown_lead_sources:
+        print("      WARNING: lead_source value(s) not in LEAD_SOURCE_BUCKET, "
+              "bucketed as 'other': %s" % ", ".join(sorted(unknown_lead_sources)),
+              flush=True)
 
     # ---- CONTACT-GRAIN: marketing-sourced contacts (created in window, in a CI list)
     print("[6/6] contact-grain (marketing-sourced contacts) ...", flush=True)
@@ -455,6 +596,7 @@ def build_dataset():
         deals=deals, d2c=d2c, d2co=d2co, company_props=company_props,
         deal_company_name=deal_company_name, contact_props=contact_props,
         sourced_contacts=sourced_contacts, src_props=src_props,
+        unknown_lead_sources=unknown_lead_sources,
     )
 
 def compute_slide15_grain(ds):
