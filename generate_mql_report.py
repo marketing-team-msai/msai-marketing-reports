@@ -84,7 +84,8 @@ LOOKBACK_DAYS = 3
 HISTORY_CHUNK = 50
 SEARCH_CAP = 9900  # HubSpot search stops paging at 10,000 results
 
-CONTACT_PROPS = ["hs_lead_status", "email", "lead_source", "createdate"]
+CONTACT_PROPS = ["hs_lead_status", "email", "lead_source", "createdate",
+                 "firstname", "lastname", "company", "hubspot_owner_id"]
 
 
 def init():

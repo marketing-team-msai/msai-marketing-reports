@@ -194,7 +194,8 @@ COLUMNS = {
     "snap_mql_entry": [
         "snapshot_date", "contact_id", "entered_at", "entered_status",
         "previous_status", "source_type", "exclusion_reason",
-        "current_lead_status", "email", "lead_source", "is_internal",
+        "current_lead_status", "email", "contact_name", "company_name",
+        "owner_name", "lead_source", "is_internal",
         "is_seeded",
     ],
     "run_log_reports": [
@@ -735,7 +736,7 @@ def rows_event_funnel(snapshot_date, ds):
     return out
 
 
-def rows_mql_entry(snapshot_date, ds):
+def rows_mql_entry(snapshot_date, ds, owners):
     """One row per entry into an MQL entry status, per contact. Entry grain:
     a contact that entered twice has two rows, and current_lead_status
     repeats on both. f_mql_by_quarter counts distinct contacts."""
@@ -753,6 +754,9 @@ def rows_mql_entry(snapshot_date, ds):
                 "exclusion_reason": e["exclusion_reason"],
                 "current_lead_status": p.get("hs_lead_status") or None,
                 "email": p.get("email") or None,
+                "contact_name": " ".join(x for x in (p.get("firstname"), p.get("lastname")) if x) or None,
+                "company_name": p.get("company") or None,
+                "owner_name": owners.get(str(p.get("hubspot_owner_id") or "")) or None,
                 "lead_source": p.get("lead_source") or None,
                 "is_internal": _is_internal(p.get("email")),
                 "is_seeded": IS_SEEDED,
@@ -935,7 +939,7 @@ def run_mql(snapshot_date, generated_at, dry_run=False, sample=2):
         since_ms = int(d.timestamp() * 1000) - mql.LOOKBACK_DAYS * 86400000
         print("     prior  %s, %d contact(s) carried forward" % (prior, len(known)))
     ds = mql.build_dataset(known_ids=known, since_ms=since_ms, full=MQL_FULL)
-    rows = rows_mql_entry(snapshot_date, ds)
+    rows = rows_mql_entry(snapshot_date, ds, sla.fetch_owners())
 
     # Display cache only. Quarter counts live in f_mql_by_quarter.
     headline = {
@@ -1558,7 +1562,9 @@ def _fixture_rows():
     # entry grain f_mql_by_quarter has to count distinct contacts over.
     ds_mql = {"contacts": {"C7": {
         "props": {"hs_lead_status": "Nurture", "email": "lead@acme.com",
-                  "lead_source": "Trade Show Lead"},
+                  "lead_source": "Trade Show Lead", "firstname": "Lee",
+                  "lastname": "Ad", "company": "Acme",
+                  "hubspot_owner_id": "77"},
         "entries": mql.entries_from_history([
             {"value": "Nurture", "timestamp": "2026-09-21T21:00:00.000Z",
              "sourceType": "AUTOMATION_PLATFORM"},
@@ -1582,7 +1588,7 @@ def _fixture_rows():
         ("snap_lead_sla", rows_lead_sla(sd, detail, owners)),
         ("snap_event_funnel", rows_event_funnel(sd, ds_events)),
         ("snap_ad_source", rows_ad_source(sd, windsor_daily)),
-        ("snap_mql_entry", rows_mql_entry(sd, ds_mql)),
+        ("snap_mql_entry", rows_mql_entry(sd, ds_mql, owners)),
         ("run_log_reports", [row_report_log("influence", sd,
                                             "2026-09-01T06:00:00+00:00",
                                             {"deals": 136, "value": 9603916.76},

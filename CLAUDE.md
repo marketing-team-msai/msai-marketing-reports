@@ -736,6 +736,13 @@ US Central quarters, computed in SQL.
 - HubSpot's lifecycle "MQL" date (`hs_v2_date_entered_marketingqualifiedlead`)
   is a different measure and was hit by the same 05-25 misfire. Not used.
 - See `docs/migrations/2026-10-04_mql_by_quarter.sql`.
+- `f_mql_contacts()` / `v_mql_contacts` is the contact list behind each
+  quarter's count (one row per contact per quarter, earliest counted entry),
+  added the same day so a quarter's number can be checked name by name. It
+  repeats `f_mql_by_quarter`'s rules rather than sharing a body, so its row
+  count per quarter MUST equal `mqls` - the VERIFY query in
+  `docs/migrations/2026-10-04_mql_contact_list.sql` checks that. Change one,
+  change both.
 
 ## Open items
 
