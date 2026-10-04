@@ -696,6 +696,47 @@ same "leave it, drop by hand only if certain" convention as
 migration. See
 `docs/migrations/2026-09-16_sourced_program_from_campaign_type.sql`.
 
+## MQLs by quarter
+
+BUILT 2026-10-04 for a tile + quarter-over-quarter chart on the Pipeline
+Influence page. Definition, per Alecia: a contact whose Lead Status
+(`hs_lead_status`) ENTERED "Awaiting Sales Qualification" - or the value
+`Returning Customer`, labelled "Awaiting Sales Qualification - Returning" -
+in the quarter, and whose Lead Status TODAY is not `JUNK` or `Disqualified`.
+Once per contact per quarter; re-entry in a later quarter counts again.
+US Central quarters, computed in SQL.
+
+- Source is the `hs_lead_status` PROPERTY HISTORY. `previous_lead_status`
+  is NOT usable: it holds labels not values, and on 2026-10-04 disagreed
+  with history on 49,240 of 49,505 contacts (usually holding the CURRENT
+  status). `lead_status___last_updated_date` IS reliable enough to narrow
+  who gets re-read (caught 363 of 363 ASQ entrants since 2026-09-01), and
+  that is all it is used for.
+- `generate_mql_report.MQL_EXCLUSIONS` is the single source for exclusions,
+  frozen into `snap_mql_entry.exclusion_reason` at ETL time. Excluded rows
+  are still written. Two, both ratified 2026-10-04:
+  `workflow_misfire_2026_05_25` (a workflow set ~5,800 List Vendor contacts
+  to ASQ, partly restored the same day; would add ~4,640 to Q2) and
+  `nurture_recycle_batch_2026_09_21` (122 Nurture contacts moved by one
+  automated batch, mostly straight back; manual entries that day count).
+- `snap_mql_entry` is ENTRY grain, not contact grain: count DISTINCT
+  `contact_id`, never rows. `f_mql_by_quarter()` / `v_mql_by_quarter`
+  does; every snapshot_date, filter server-side as always.
+- Incremental: each run re-reads the previous snapshot's contacts plus
+  anyone with `lead_status___last_updated_date` within 3 days of it plus
+  anyone in an entry status now. ~30 seconds a day. First run, and every
+  Sunday in the workflow (`--mql-full`), reads all ~49.5k contacts,
+  15-20 minutes. `run_mql` deletes today's rows before writing, the one
+  place the sync deletes snapshot rows, so a same-day re-run cannot orphan.
+- Verified 2026-10-04 from a full read: Q1 126 entered / 73 MQL, Q2 228 /
+  192, Q3 265 / 213. The "today" rule penalises older quarters (Q1 lost 53
+  to Junk/DQ, Q3 52 of a larger base), so part of the upward trend is
+  definitional. The status first appears in history in August 2025;
+  nothing earlier is comparable.
+- HubSpot's lifecycle "MQL" date (`hs_v2_date_entered_marketingqualifiedlead`)
+  is a different measure and was hit by the same 05-25 misfire. Not used.
+- See `docs/migrations/2026-10-04_mql_by_quarter.sql`.
+
 ## Open items
 
 - Every logged-in employee can read all of `mktg` directly. `authenticated`

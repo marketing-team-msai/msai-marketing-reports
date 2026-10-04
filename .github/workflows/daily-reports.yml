@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one report only: influence, netnew, sla, events or ad_source. Blank = all five.'
+        description: 'Run one report only: influence, netnew, sla, events, ad_source or mql. Blank = all six.'
         required: false
         default: ''
       dry_run:
@@ -104,6 +104,10 @@ jobs:
           ARGS=""
           if [ -n "${{ inputs.only }}" ];          then ARGS="$ARGS --only ${{ inputs.only }}"; fi
           if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          # Sundays the mql leg re-reads every contact's lead status history
+          # (~15-20 min) instead of only those changed since yesterday - a
+          # safety net for any change lead_status___last_updated_date missed.
+          if [ "$(date +%u)" = "7" ];              then ARGS="$ARGS --mql-full"; fi
           python sync_to_mktg.py $ARGS
 
       - name: Remove secrets file

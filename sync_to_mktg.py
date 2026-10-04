@@ -40,6 +40,16 @@ never computes or stores them.
                                            not just "today". Every run rewrites the
                                            whole window, which is what naturally
                                            backfills history on the first run.
+  mql        generate_mql_report.py     -> mktg.snap_mql_entry
+                                           one row per ENTRY into Lead Status
+                                           Awaiting Sales Qualification (or
+                                           Returning Customer), per day. Read
+                                           from hs_lead_status history.
+                                           Incremental: re-reads the previous
+                                           snapshot's contacts plus anyone whose
+                                           lead status changed since; a full
+                                           portal read on the first run or with
+                                           --mql-full. f_mql_by_quarter counts.
 
 Run bookkeeping:
 
@@ -75,7 +85,8 @@ Usage
                                             to generate_netnew_report.py, network
   python sync_to_mktg.py --dry-run --sample 5   compute, print 5 rows, write nothing
   python sync_to_mktg.py --only influence   one report
-  python sync_to_mktg.py                    all five
+  python sync_to_mktg.py --only mql --mql-full   MQL leg, every contact
+  python sync_to_mktg.py                    all six
 """
 
 import argparse
@@ -93,6 +104,7 @@ import generate_report as influence
 import generate_netnew_report as netnew
 import generate_sla_report as sla
 import generate_events_report as events
+import generate_mql_report as mql
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -179,6 +191,12 @@ COLUMNS = {
         "stage", "close_date", "create_date", "amount_home", "is_won",
         "is_closed", "is_influenced", "is_amazon", "is_galco", "is_seeded",
     ],
+    "snap_mql_entry": [
+        "snapshot_date", "contact_id", "entered_at", "entered_status",
+        "previous_status", "source_type", "exclusion_reason",
+        "current_lead_status", "email", "lead_source", "is_internal",
+        "is_seeded",
+    ],
     "run_log_reports": [
         "snapshot_date", "report", "generated_at", "status", "row_count",
         "metrics", "is_seeded",
@@ -197,6 +215,7 @@ ON_CONFLICT = {
     "snap_event_funnel":    "snapshot_date,event_id",
     "snap_all_deals":       "snapshot_date,deal_id",
     "snap_ad_source":       "snapshot_date,metric_date,source,account",
+    "snap_mql_entry":       "snapshot_date,contact_id,entered_at",
     "run_log_reports":      "snapshot_date,report",
     "run_log":              "snapshot_date",
 }
@@ -716,6 +735,31 @@ def rows_event_funnel(snapshot_date, ds):
     return out
 
 
+def rows_mql_entry(snapshot_date, ds):
+    """One row per entry into an MQL entry status, per contact. Entry grain:
+    a contact that entered twice has two rows, and current_lead_status
+    repeats on both. f_mql_by_quarter counts distinct contacts."""
+    out = []
+    for cid, c in ds["contacts"].items():
+        p = c["props"]
+        for e in c["entries"]:
+            out.append({
+                "snapshot_date": snapshot_date,
+                "contact_id": cid,
+                "entered_at": e["entered_at"],
+                "entered_status": e["entered_status"],
+                "previous_status": e["previous_status"],
+                "source_type": e["source_type"] or None,
+                "exclusion_reason": e["exclusion_reason"],
+                "current_lead_status": p.get("hs_lead_status") or None,
+                "email": p.get("email") or None,
+                "lead_source": p.get("lead_source") or None,
+                "is_internal": _is_internal(p.get("email")),
+                "is_seeded": IS_SEEDED,
+            })
+    return out
+
+
 # ------------------------------------------------------------- runners -------
 def _report_delta(name, headline, keys, dry_run):
     prior = read_prior(name) if not dry_run else None
@@ -848,6 +892,68 @@ def run_ad_source(snapshot_date, generated_at, dry_run=False, sample=2):
 
     n = sb_upsert("snap_ad_source", rows, dry_run=dry_run, sample=sample)
     write_report_log("ad_source", snapshot_date, generated_at, headline, n,
+                     dry_run=dry_run)
+    return headline, n
+
+
+# Set by --mql-full. A module flag rather than a runner argument so every
+# runner keeps the same (snapshot_date, generated_at, dry_run, sample) shape.
+MQL_FULL = False
+
+
+def _prior_mql_contacts(snapshot_date):
+    """(prior snapshot_date, contact ids in it) from snap_mql_entry, or
+    (None, None) when there is no earlier snapshot. Paged: one snapshot is
+    several thousand rows, well past PostgREST's 1000-row cap."""
+    rows = sb_select("snap_mql_entry",
+                     "select=snapshot_date&snapshot_date=lt.%s"
+                     "&order=snapshot_date.desc&limit=1" % snapshot_date)
+    if not rows:
+        return None, None
+    prior = rows[0]["snapshot_date"]
+    ids, offset = set(), 0
+    while True:
+        page = sb_select("snap_mql_entry",
+                         "select=contact_id&snapshot_date=eq.%s"
+                         "&order=contact_id,entered_at&limit=1000&offset=%d"
+                         % (prior, offset))
+        ids.update(r["contact_id"] for r in page)
+        if len(page) < 1000:
+            return prior, ids
+        offset += 1000
+
+
+def run_mql(snapshot_date, generated_at, dry_run=False, sample=2):
+    print("[mql] pulling HubSpot lead status history ...")
+    mql.init()
+    prior, known = (None, None)
+    if not MQL_FULL:
+        prior, known = _prior_mql_contacts(snapshot_date)
+    since_ms = None
+    if prior:
+        d = datetime.strptime(prior, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        since_ms = int(d.timestamp() * 1000) - mql.LOOKBACK_DAYS * 86400000
+        print("     prior  %s, %d contact(s) carried forward" % (prior, len(known)))
+    ds = mql.build_dataset(known_ids=known, since_ms=since_ms, full=MQL_FULL)
+    rows = rows_mql_entry(snapshot_date, ds)
+
+    # Display cache only. Quarter counts live in f_mql_by_quarter.
+    headline = {
+        "mode": ds["mode"],
+        "contacts_read": ds["read"],
+        "contacts_with_entries": len(ds["contacts"]),
+        "entry_rows": len(rows),
+        "excluded_rows": sum(1 for r in rows if r["exclusion_reason"]),
+    }
+    _report_delta("mql", headline, ["contacts_with_entries", "entry_rows"], dry_run)
+
+    # Entry grain can shrink on a same-day re-run (a contact merged or
+    # deleted in HubSpot). Clear today's rows first so the upsert-never-
+    # deletes rule cannot leave orphans in this table.
+    if not dry_run:
+        sb_delete("snap_mql_entry", "snapshot_date=eq.%s" % snapshot_date)
+    n = sb_upsert("snap_mql_entry", rows, dry_run=dry_run, sample=sample)
+    write_report_log("mql", snapshot_date, generated_at, headline, n,
                      dry_run=dry_run)
     return headline, n
 
@@ -1448,6 +1554,26 @@ def _fixture_rows():
             {"clicks": 8.0, "spend": 0.0, "impr": 300.0, "conv": 0.0},
     }
 
+    # One counted entry and one excluded entry for the same contact - the
+    # entry grain f_mql_by_quarter has to count distinct contacts over.
+    ds_mql = {"contacts": {"C7": {
+        "props": {"hs_lead_status": "Nurture", "email": "lead@acme.com",
+                  "lead_source": "Trade Show Lead"},
+        "entries": mql.entries_from_history([
+            {"value": "Nurture", "timestamp": "2026-09-21T21:00:00.000Z",
+             "sourceType": "AUTOMATION_PLATFORM"},
+            {"value": "Awaiting Sales Qualification",
+             "timestamp": "2026-09-21T20:59:00.000Z",
+             "sourceType": "AUTOMATION_PLATFORM"},
+            {"value": "Nurture", "timestamp": "2026-08-01T12:00:00.000Z",
+             "sourceType": "CRM_UI"},
+            {"value": "Awaiting Sales Qualification",
+             "timestamp": "2026-07-14T15:00:00.000Z",
+             "sourceType": "CRM_UI"},
+            {"value": "NEW", "timestamp": "2025-01-01T00:00:00.000Z",
+             "sourceType": "IMPORT"},
+        ])}}}
+
     return [
         ("snap_influence", rows_influence(sd, ds_inf)),
         ("snap_all_deals", rows_all_deals(sd, ds_inf)),
@@ -1456,6 +1582,7 @@ def _fixture_rows():
         ("snap_lead_sla", rows_lead_sla(sd, detail, owners)),
         ("snap_event_funnel", rows_event_funnel(sd, ds_events)),
         ("snap_ad_source", rows_ad_source(sd, windsor_daily)),
+        ("snap_mql_entry", rows_mql_entry(sd, ds_mql)),
         ("run_log_reports", [row_report_log("influence", sd,
                                             "2026-09-01T06:00:00+00:00",
                                             {"deals": 136, "value": 9603916.76},
@@ -1520,6 +1647,15 @@ def _selftest():
     print("ad_source grain: %d row(s), is_paid per row (same source, "
           "different days): %s"
           % (len(ads), sorted((r["metric_date"], r["is_paid"]) for r in ads)))
+
+    me = by_table["snap_mql_entry"]
+    print("")
+    print("mql entry grain: %d row(s) for 1 contact, exclusions: %s"
+          % (len(me), [(r["entered_at"], r["previous_status"], r["exclusion_reason"])
+                       for r in me]))
+    if [r["exclusion_reason"] for r in me] != [None, "nurture_recycle_batch_2026_09_21"]:
+        print("MISMATCH mql exclusions")
+        ok = False
     return 0 if ok else 1
 
 
@@ -1528,8 +1664,11 @@ def main():
     ap = argparse.ArgumentParser(
         description="Sync report detail into the mktg schema.")
     ap.add_argument("--only",
-                    choices=["influence", "netnew", "sla", "events", "ad_source"],
-                    help="run one report instead of all five")
+                    choices=["influence", "netnew", "sla", "events", "ad_source", "mql"],
+                    help="run one report instead of all six")
+    ap.add_argument("--mql-full", action="store_true",
+                    help="mql leg reads every contact's history instead of "
+                         "only those changed since the previous snapshot")
     ap.add_argument("--dry-run", action="store_true",
                     help="compute and print payloads, write nothing")
     ap.add_argument("--sample", type=int, default=2,
@@ -1601,8 +1740,11 @@ def main():
     started = datetime.now(timezone.utc)
     snapshot_date, gen_at = started.strftime("%Y-%m-%d"), started.isoformat()
 
+    global MQL_FULL
+    MQL_FULL = args.mql_full
+
     jobs = [("influence", run_influence), ("netnew", run_netnew), ("sla", run_sla),
-            ("events", run_events), ("ad_source", run_ad_source)]
+            ("events", run_events), ("ad_source", run_ad_source), ("mql", run_mql)]
     if args.only:
         jobs = [j for j in jobs if j[0] == args.only]
 
