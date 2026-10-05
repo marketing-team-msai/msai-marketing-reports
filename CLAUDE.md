@@ -703,8 +703,17 @@ Influence page. Definition, per Alecia: a contact whose Lead Status
 (`hs_lead_status`) ENTERED "Awaiting Sales Qualification" - or the value
 `Returning Customer`, labelled "Awaiting Sales Qualification - Returning" -
 in the quarter, and whose Lead Status TODAY is not `JUNK` or `Disqualified`.
-Once per contact per quarter; re-entry in a later quarter counts again.
 US Central quarters, computed in SQL.
+
+FIRST QUARTER ONLY, changed later on 2026-10-04 (the original rule counted a
+contact again in each quarter it re-entered; Q3 read 213). A contact counts
+only in the first quarter it EVER entered. ANY earlier-quarter entry blocks a
+later one - including entries tagged with an `exclusion_reason`. Alecia's
+explicit call: having been put in the status at all, even by the misfire,
+means the contact is not new. Same-quarter entries are unaffected. Moved Q1
+73 -> 70, Q2 192 -> 186, Q3 213 -> 153 (38 real repeats + 22 misfire-only),
+Q4 30. `f_mql_by_quarter.repeat_contacts` shows the repeats. See
+`docs/migrations/2026-10-04_mql_first_quarter_only.sql`.
 
 - Source is the `hs_lead_status` PROPERTY HISTORY. `previous_lead_status`
   is NOT usable: it holds labels not values, and on 2026-10-04 disagreed
@@ -728,8 +737,9 @@ US Central quarters, computed in SQL.
   Sunday in the workflow (`--mql-full`), reads all ~49.5k contacts,
   15-20 minutes. `run_mql` deletes today's rows before writing, the one
   place the sync deletes snapshot rows, so a same-day re-run cannot orphan.
-- Verified 2026-10-04 from a full read: Q1 126 entered / 73 MQL, Q2 228 /
-  192, Q3 265 / 213. The "today" rule penalises older quarters (Q1 lost 53
+- Verified 2026-10-04 from a full read, under the original per-quarter
+  rule: Q1 126 entered / 73 MQL, Q2 228 / 192, Q3 265 / 213 (superseded
+  by first-quarter-only above). The "today" rule penalises older quarters (Q1 lost 53
   to Junk/DQ, Q3 52 of a larger base), so part of the upward trend is
   definitional. The status first appears in history in August 2025;
   nothing earlier is comparable.

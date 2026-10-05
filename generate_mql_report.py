@@ -9,8 +9,11 @@ DEFINITION (Alecia, 2026-10-04)
     (hs_lead_status) ENTERED "Awaiting Sales Qualification" - or
     "Awaiting Sales Qualification - Returning", stored as the value
     'Returning Customer' - during Q, and its Lead Status TODAY is not
-    Junk or Disqualified. Counted once per contact per quarter; a contact
-    that enters again in a later quarter counts again there.
+    Junk or Disqualified. A contact counts only in the FIRST quarter it ever
+    entered (changed the same day, 2026-10-04): any earlier-quarter entry,
+    excluded ones included, means a later entry is a repeat, not a new MQL.
+    That rule lives in SQL (f_mql_by_quarter / f_mql_contacts); this module
+    still writes every entry so repeats stay visible.
 
     "Entered" is read from the hs_lead_status PROPERTY HISTORY: an entry
     is a history row carrying one of ENTRY_STATUSES whose previous row did
